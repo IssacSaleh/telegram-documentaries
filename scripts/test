@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# scripts/test — run the full test suite. Ground truth for tests.
+# SPECS/TECH.md: "Dev scripts live in scripts/ ... and are the ground truth
+# for tests, lint, and type checks."
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==> pytest"
+python3 -m pytest tests/ -q
+
+echo "==> OK"

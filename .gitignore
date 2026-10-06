@@ -6,6 +6,16 @@
 # Dependencies
 node_modules/
 .opencode/node_modules/
+.venv/
+venv/
+
+# Python build/test artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Local IDE / Codio workspace config
 .codio

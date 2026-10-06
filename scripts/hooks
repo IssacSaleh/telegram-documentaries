@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# scripts/hooks — lint + type checks. Ground truth for pre-commit hooks.
+# SPECS/TECH.md: "Dev scripts live in scripts/ ... and are the ground truth
+# for tests, lint, and type checks."
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==> ruff check"
+python3 -m ruff check app tests
+
+echo "==> mypy"
+python3 -m mypy app
+
+echo "==> OK"
