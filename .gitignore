@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Dependencies
+node_modules/
+.opencode/node_modules/
+
+# Local IDE / Codio workspace config
+.codio
+.settings
+.guides/
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db
+
+# Git safety: never commit nested git metadata
+.git/
