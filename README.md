@@ -3,6 +3,18 @@
 Interactive learning applets explaining how Telegram bots work — part of the
 Telegram Documentaries project.
 
+## Constitution
+
+The project contract lives in [`SPECS/`](SPECS/) — read these first:
+
+| File | Purpose |
+| --- | --- |
+| [`SPECS/MISSION.md`](SPECS/MISSION.md) | What the product does, scope, and success criteria |
+| [`SPECS/TECH.md`](SPECS/TECH.md) | Stack, architecture, and the policies that are enforced |
+| [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md) | Ordered build plan, phase by phase |
+
+Every feature spec and implementation decision defers to these three files.
+
 ## Contents
 
 | File | Description |
