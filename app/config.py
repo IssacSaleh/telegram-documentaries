@@ -3,9 +3,8 @@
 SPECS/MISSION.md non-negotiable: "Never hardcode or commit secrets."
 Values are read at runtime and never logged.
 
-Phase 1 uses `TELEGRAM_BOT_TOKEN` only. `GEMINI_API_KEY` is loaded here so
-the config surface matches `.env.example`, but it is deliberately unused
-until later phases (no model calls yet).
+`TELEGRAM_BOT_TOKEN` drives the transport; `GEMINI_API_KEY` authorises the
+Bouncer's Gemini vision calls (Phase 2). Both are required by the loader.
 """
 
 from __future__ import annotations
@@ -14,11 +13,33 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 from app.logging_utils import get_logger
 
 logger = get_logger("config")
+
+#: Telegram Bot API base URL. Shared by the gateway and the Bouncer — one
+#: source of truth so the two can never drift apart (they both build
+#: token-bearing URLs against it).
+TELEGRAM_API = "https://api.telegram.org"
+
+
+def telegram_payload(response: httpx.Response) -> dict:
+    """Parsed JSON body of a Telegram response; `{}` when it is not an object.
+
+    Telegram answers errors with a JSON `{"ok": false, ...}` body *and*, via
+    proxies and load balancers, with plain HTML error pages. Callers must
+    never `raise_for_status()` on these responses: the request URL carries
+    the bot token and `httpx` embeds the full URL in the exception message,
+    which would leak the secret into the logs (SPECS/MISSION.md).
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class ConfigError(RuntimeError):

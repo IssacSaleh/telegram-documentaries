@@ -38,7 +38,6 @@ PHOTO_UPDATE = {
 
 
 def photo_update(chat_id: int = 6682234839) -> TelegramUpdate:
-    payload = dict(PHOTO_UPDATE)
     payload = {
         "update_id": 42,
         "message": {
@@ -261,18 +260,24 @@ class TestFailureModes:
                           classifier=ExplodingClassifier())
         assert decision.error is True
 
-    def test_classifier_failure_is_logged_and_does_not_reject_the_user(self) -> None:
+    def test_classifier_failure_is_logged_and_does_not_reject_the_user(
+        self, caplog
+    ) -> None:
         class ExplodingClassifier:
             def classify(self, image_bytes: bytes, mime_type: str) -> BouncerVerdict:
                 raise RuntimeError("gemini 500")
 
-        with caplog_disabled():
+        with caplog.at_level(logging.ERROR, logger="telegram_documentaries.bouncer"):
             decision = bounce(photo_update(), fetcher=FakeFetcher(),
                               classifier=ExplodingClassifier())
 
         # degrade gracefully: no rejection, no crash, error flagged
         assert decision.reply is None
         assert decision.error is True
+        # ...and the failure is loud, not silent (SPECS/TECH.md error policy)
+        assert any(
+            "event=classification_failed" in r.message for r in caplog.records
+        )
 
     def test_photo_update_with_empty_photo_array_is_handled(self) -> None:
         update = TelegramUpdate.model_validate(
@@ -283,16 +288,6 @@ class TestFailureModes:
                           classifier=FakeClassifier(human()))
         assert decision.error is True
         assert decision.reply is None
-
-
-class caplog_disabled:
-    """Context manager: capture logs without asserting on them."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
 
 
 # ---------------------------------------------------------------------------

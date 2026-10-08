@@ -17,11 +17,25 @@ Every feature spec and implementation decision defers to these three files.
 
 ## Project status
 
-**Phase 1 — Repository & gateway (in progress).** The bot long-polls Telegram
-and replies to every message with a hardcoded `hey mate!`. **No Gemini/model
-API calls yet**; `GEMINI_API_KEY` is loaded from `.env` but unused.
+**Phase 1 — Repository & gateway.** The bot long-polls Telegram and replies
+to every text message with a hardcoded `hey mate!`.
 
-Next phases are ordered in [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md).
+**Phase 2 — The Bouncer (vision gate).** Upload a photo and the bot downloads
+the image bytes, then hands them to **Gemini 3.1 Flash Lite** through a Google
+ADK agent for multimodal classification: is a discernible human face or body
+present?
+
+- **Human detected** → the admission falls through to the confirmation flow,
+  which continues unchanged.
+- **No human detected** → a cheeky rejection is sent and that chat's ephemeral
+  state is reset. Rejects are logged.
+- **Bouncer failure** (download or classification error) → a friendly
+  fallback reply, never silence; the session is left untouched.
+
+`GEMINI_API_KEY` is required: it authorises the Bouncer's Gemini calls.
+
+Later phases (interview, converter, narration, voice) are ordered in
+[`SPECS/ROADMAP.md`](SPECS/ROADMAP.md).
 
 ## Contents
 
@@ -29,7 +43,9 @@ Next phases are ordered in [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md).
 | --- | --- |
 | `app/` | Gateway source: models, state, config, logging, polling loop |
 | `app/main.py` | **Entrypoint** — `python -m app.main` |
+| `app/bouncer.py` | **The Bouncer** — photo download + Gemini vision classification |
 | `tests/` | Test suite (`unit/` = no real I/O, `integration/` = real API) |
+| `tests/fixtures/` | Content-verified images for the live Bouncer tests |
 | `scripts/test`, `scripts/hooks` | Dev scripts — ground truth for checks |
 | `requirements.txt`, `requirements-dev.txt` | Reproducible dependencies |
 | `telegram-arch.html` | Interactive diagram: **Polling vs Webhooks** for the Telegram Bot API |
@@ -71,12 +87,14 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
-Both keys are **required** by the loader, even though Phase 1 only uses
-`TELEGRAM_BOT_TOKEN` — the config surface matches `.env.example` so later
-phases need no changes.
+Both keys are **required** by the loader:
+
+- `TELEGRAM_BOT_TOKEN` — the transport.
+- `GEMINI_API_KEY` — the Bouncer's Gemini vision classification.
 
 > **Note:** `.env` is gitignored and must never be committed. Secret values are
-> never logged — `Settings.__repr__` redacts them.
+> never logged — `Settings.__repr__` redacts them, and no Telegram request
+> failure may surface the token-bearing URL in a log line or exception.
 
 ### 3. Run the bot
 
@@ -84,8 +102,9 @@ phases need no changes.
 python -m app.main
 ```
 
-It long-polls Telegram and replies `hey mate!` to every text message. Stop it
-with `Ctrl-C`.
+It long-polls Telegram and replies `hey mate!` to every text message. Send it
+a photo to exercise the Bouncer: a portrait is admitted, anything else gets
+the rejection. Stop it with `Ctrl-C`.
 
 ## Development
 
@@ -98,9 +117,25 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 40 tests
+./scripts/test    # 107 offline tests + 3 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
+
+The default run is **offline and deterministic**: unit tests make no network
+calls, and the live Gemini tests are skipped.
+
+### Live Bouncer tests
+
+Three integration tests drive the real Bouncer end to end against Gemini 3.1
+Flash Lite — a person is admitted, a landscape is rejected (with state reset),
+and a rejection never touches another chat's state. Enable them explicitly:
+
+```bash
+RUN_LIVE_TESTS=1 ./scripts/test
+```
+
+They read `tests/fixtures/person.jpg` and `tests/fixtures/landscape.jpg`,
+whose contents were verified against the same model.
 
 Tests are written **before** code (Red/Green TDD — SPECS/TECH.md). See
 [`SPECS/TECH.md`](SPECS/TECH.md) for the full policy.

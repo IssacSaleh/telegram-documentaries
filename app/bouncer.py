@@ -23,6 +23,7 @@ from typing import Protocol
 
 import httpx
 
+from app.config import TELEGRAM_API, telegram_payload
 from app.logging_utils import get_logger, logged
 from app.models import BouncerVerdict, OutboundMessage, TelegramUpdate
 from app.state import get_store
@@ -31,8 +32,6 @@ logger = get_logger("bouncer")
 
 #: Model used for the vision gate (SPECS/TECH.md exact ID).
 BOUNCER_MODEL = "gemini-3.1-flash-lite"
-
-TELEGRAM_API = "https://api.telegram.org"
 
 
 class RejectionPolicy:
@@ -103,20 +102,34 @@ class TelegramPhotoFetcher:
         self._client = client
 
     def fetch(self, file_id: str) -> tuple[bytes, str]:
-        info = self._client.get(
+        # No raise_for_status() anywhere in here: every URL in this class
+        # carries the bot token, and httpx embeds the full URL in the
+        # exception message — which would leak the secret into the logs
+        # (SPECS/MISSION.md). Failures are reported as status + description.
+        info_response = self._client.get(
             f"{TELEGRAM_API}/bot{self._token}/getFile",
             params={"file_id": file_id},
             timeout=30.0,
-        ).json()
-        if not info.get("ok"):
-            raise RuntimeError(f"getFile failed: {info.get('description')!r}")
+        )
+        info = telegram_payload(info_response)
+        if not info_response.is_success or not info.get("ok"):
+            raise RuntimeError(
+                "getFile failed: "
+                f"HTTP {info_response.status_code} "
+                f"{info.get('description') or 'non-json body'}"
+            )
 
         path = info["result"]["file_path"]
         response = self._client.get(
             f"{TELEGRAM_API}/bot{self._token}/file/{path}",
             timeout=60.0,
         )
-        response.raise_for_status()
+        if not response.is_success:
+            detail = telegram_payload(response).get("description")
+            raise RuntimeError(
+                f"file download failed: HTTP {response.status_code}"
+                + (f" {detail}" if detail else "")
+            )
 
         mime = _guess_mime_type(path, response.headers.get("content-type"))
         return response.content, mime
@@ -135,6 +148,21 @@ def _guess_mime_type(path: str, header: str | None) -> str:
     if lowered.endswith(".gif"):
         return "image/gif"
     return "image/jpeg"
+
+
+def _extract_json(text: str) -> str:
+    """Pull the JSON object out of a response that may carry prose around it.
+
+    Structured output is the contract, but a model occasionally narrates
+    ("Here is my verdict: {...}") before answering. Tolerating that is
+    cheaper than a failed classification, and the object is still validated
+    by `BouncerVerdict` on the way in.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 
 class AdkHumanPresenceClassifier:
@@ -158,11 +186,16 @@ class AdkHumanPresenceClassifier:
         )
 
     def classify(self, image_bytes: bytes, mime_type: str) -> BouncerVerdict:
+        """Run the ADK agent to completion. Synchronous by design.
+
+        The gateway is a synchronous long-poll loop, so there is no running
+        event loop to hang this on — `asyncio.run` creates and closes its
+        own (unlike the deprecated `get_event_loop().run_until_complete`,
+        which leaks the loop and fails outside the main thread).
+        """
         import asyncio
 
-        return asyncio.get_event_loop().run_until_complete(
-            self._classify_async(image_bytes, mime_type)
-        )
+        return asyncio.run(self._classify_async(image_bytes, mime_type))
 
     async def _classify_async(self, image_bytes: bytes, mime_type: str) -> BouncerVerdict:
         import uuid
@@ -170,6 +203,9 @@ class AdkHumanPresenceClassifier:
         from google.adk.runners import InMemoryRunner
         from google.genai import types
 
+        # One runner per photo: cheap enough at Phase 2 volume, and it keeps
+        # verdicts from separate chats from ever sharing a session. Revisit
+        # when the Interviewer/Converter arrive and per-call setup gets dear.
         runner = InMemoryRunner(agent=self._agent, app_name="bouncer")
         session_id = f"bouncer-{uuid.uuid4().hex}"
         await runner.session_service.create_session(
@@ -184,21 +220,31 @@ class AdkHumanPresenceClassifier:
             ],
         )
 
+        # The final response event carries the complete answer; earlier
+        # events may be streamed fragments or progress text we must not
+        # concatenate into the structured output.
         final_text: str | None = None
+        latest_text: str | None = None
         async for event in runner.run_async(
             user_id="bouncer",
             session_id=session_id,
             new_message=content,
         ):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        final_text = (final_text or "") + part.text
+            if not (event.content and event.content.parts):
+                continue
+            chunk = "".join(part.text for part in event.content.parts if part.text)
+            if not chunk:
+                continue
+            latest_text = chunk
+            if event.is_final_response():
+                final_text = chunk
 
+        if final_text is None:
+            final_text = latest_text
         if final_text is None:
             raise RuntimeError("bouncer agent returned no output")
 
-        return BouncerVerdict.model_validate_json(final_text)
+        return BouncerVerdict.model_validate_json(_extract_json(final_text))
 
 
 # ---------------------------------------------------------------------------

@@ -77,8 +77,6 @@ class TestPhotoSizes:
     """Telegram sends `photo` as an ARRAY of sizes; we must take the largest."""
 
     def test_parses_a_photo_array(self) -> None:
-        from app.models import TelegramUpdate
-
         update = TelegramUpdate.model_validate(_PHOTO_UPDATE)
 
         assert update.message is not None
@@ -86,8 +84,6 @@ class TestPhotoSizes:
         assert update.message.photo[0].file_id == "small"
 
     def test_largest_photo_is_the_last_and_biggest(self) -> None:
-        from app.models import TelegramUpdate
-
         update = TelegramUpdate.model_validate(_PHOTO_UPDATE)
         assert update.message is not None
 
@@ -100,8 +96,6 @@ class TestPhotoSizes:
         assert largest.width > max(p.width for p in update.message.photo[:-1])
 
     def test_largest_photo_is_none_when_no_photo(self) -> None:
-        from app.models import TelegramUpdate
-
         update = TelegramUpdate.model_validate(
             {"update_id": 1, "message": {"message_id": 1, "date": 1,
                                          "chat": {"id": 5, "type": "private"}, "text": "hi"}}
@@ -110,19 +104,12 @@ class TestPhotoSizes:
         assert update.message.largest_photo() is None
 
     def test_photo_message_has_no_text(self) -> None:
-        from app.models import TelegramUpdate
-
         update = TelegramUpdate.model_validate(_PHOTO_UPDATE)
         assert update.message is not None
         assert update.message.text is None
         assert update.message.largest_photo() is not None
 
     def test_rejects_photo_without_file_id(self) -> None:
-        import pytest
-        from pydantic import ValidationError
-
-        from app.models import TelegramUpdate
-
         bad = {"update_id": 1, "message": {"message_id": 1, "date": 1,
                "chat": {"id": 5, "type": "private"},
                "photo": [{"width": 10, "height": 10}]}}
@@ -131,11 +118,6 @@ class TestPhotoSizes:
             TelegramUpdate.model_validate(bad)
 
     def test_outbound_rejection_text_is_not_empty(self) -> None:
-        import pytest
-        from pydantic import ValidationError
-
-        from app.models import OutboundMessage
-
         with pytest.raises(ValidationError):
             OutboundMessage(chat_id=1, text="")
 
