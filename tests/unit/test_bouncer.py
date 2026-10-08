@@ -13,7 +13,10 @@ from __future__ import annotations
 import logging
 
 from app.bouncer import (
+    BOUNCER_INSTRUCTION,
+    BOUNCER_MODEL,
     REJECTION_REPLY,
+    AdkHumanPresenceClassifier,
     BouncerDecision,
     bounce,
 )
@@ -307,3 +310,117 @@ class TestDecisionShape:
         no = bounce(photo_update(), fetcher=FakeFetcher(),
                     classifier=FakeClassifier(no_human()))
         assert yes.admitted is True and no.admitted is False
+
+
+class TestAdkWiring:
+    """The Google ADK agent must be wired exactly as SPECS/TECH.md pins it.
+
+    Building `AdkHumanPresenceClassifier` constructs the `LlmAgent` but makes
+    no network call — Gemini is only reached inside `classify()`. So this
+    asserts the wiring offline, while the live tests in `tests/integration/`
+    prove the very same agent really classifies a person and a landscape.
+    """
+
+    def test_agent_is_wired_with_the_pinned_model_and_structured_output(
+        self,
+    ) -> None:
+        agent = AdkHumanPresenceClassifier()._agent
+
+        assert agent.name == "bouncer"
+        # SPECS/TECH.md: vision gate model is `gemini-3.1-flash-lite`.
+        assert BOUNCER_MODEL == "gemini-3.1-flash-lite"
+        assert agent.model == BOUNCER_MODEL
+        # Structured output, so a verdict can never cross the boundary raw.
+        assert agent.output_schema is BouncerVerdict
+
+    def test_instruction_limits_the_verdict_to_human_presence(self) -> None:
+        instruction = BOUNCER_INSTRUCTION.lower()
+
+        assert "human" in instruction
+        assert "face" in instruction
+        assert "body" in instruction
+        # Classification only — no narration, no TTS, no video (MISSION.md).
+        assert "video" not in instruction
+
+
+class TestAdkResponseParsing:
+    """How the ADK agent's response becomes a typed `BouncerVerdict`.
+
+    Gemini itself is only reached in `tests/integration/`, but everything
+    that runs AFTER the model answers must be proven offline: prose around
+    the JSON, and streamed fragments before it, must not break the verdict —
+    otherwise a photo would silently fall into the "degraded" path instead
+    of being admitted or rejected.
+    """
+
+    @staticmethod
+    def _event(text: str, *, final: bool):
+        from google.genai import types
+
+        class _Event:
+            def __init__(self) -> None:
+                self.content = types.Content(
+                    role="model", parts=[types.Part.from_text(text=text)]
+                )
+
+            def is_final_response(self) -> bool:
+                return final
+
+        return _Event()
+
+    @staticmethod
+    def _classify_with(monkeypatch, events) -> BouncerVerdict:
+        """Run the real classifier with the ADK runner stubbed out."""
+        from google.adk import runners
+
+        class _Runner:
+            def __init__(self, agent, app_name) -> None:
+                self.session_service = self
+
+            async def create_session(self, **kwargs) -> None:
+                return None
+
+            async def run_async(self, **kwargs):
+                for event in events:
+                    yield event
+
+        monkeypatch.setattr(runners, "InMemoryRunner", _Runner)
+        return AdkHumanPresenceClassifier().classify(b"\xff\xd8fake", "image/jpeg")
+
+    def test_a_plain_json_response_becomes_a_verdict(self, monkeypatch) -> None:
+        verdict = self._classify_with(
+            monkeypatch,
+            [
+                self._event(
+                    '{"human_present": false, "confidence": 0.95, '
+                    '"reason": "a mountain range"}',
+                    final=True,
+                )
+            ],
+        )
+
+        assert verdict.human_present is False
+        assert verdict.confidence == 0.95
+        assert verdict.reason == "a mountain range"
+
+    def test_prose_around_the_json_and_streamed_fragments_are_tolerated(
+        self, monkeypatch
+    ) -> None:
+        """The final response wins, and the object is lifted out of any
+        narration — an earlier partial fragment must not be concatenated."""
+        verdict = self._classify_with(
+            monkeypatch,
+            [
+                self._event('{"human_present": tru', final=False),
+                self._event(
+                    'Here is my verdict: {"human_present": true, '
+                    '"confidence": 0.97, "reason": "a clear portrait"} — '
+                    "a human is present.",
+                    final=True,
+                ),
+            ],
+        )
+
+        assert verdict.human_present is True
+        assert verdict.confidence == 0.97
+        assert verdict.reason == "a clear portrait"
