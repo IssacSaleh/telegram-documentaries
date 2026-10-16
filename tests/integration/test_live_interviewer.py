@@ -15,9 +15,8 @@ import os
 
 import pytest
 
-from app.interviewer import AdkInterviewer, MIN_QUESTIONS
+from app.interviewer import AdkInterviewer
 from app.models import Dossier, DossierAnswer, InterviewTurn
-from app.state import get_store
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_TESTS") != "1",
