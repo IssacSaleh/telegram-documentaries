@@ -7,7 +7,7 @@ from collections.abc import Iterable
 
 import pytest
 
-from app.models import BouncerVerdict, OutboundMessage
+from app.models import BouncerVerdict, InterviewTurn, OutboundMessage
 
 # A realistic Telegram `getUpdates` payload. Deliberately stuffed with extra
 # fields Telegram actually sends but our models do not care about, to prove
@@ -160,3 +160,57 @@ def human_verdict() -> BouncerVerdict:
 
 def no_human_verdict() -> BouncerVerdict:
     return BouncerVerdict(human_present=False, confidence=0.97, reason="a mountain range")
+
+
+class FakeInterviewer:
+    """`Interviewer` double: scripted turns, no network, fully deterministic.
+
+    `turns` is a script for the next `next_turn` calls, popped in order. Once
+    the script runs out, the double behaves like a sensible adaptive
+    interviewer: it asks a generic question until `completion_after`
+    questions have been answered, then it completes with `animal`. Set
+    `completion_after` high to observe the code's minimum-question guard, or
+    pass an explicit completion turn to observe premature-completion handling.
+    """
+
+    def __init__(
+        self,
+        turns: Iterable[InterviewTurn] | None = None,
+        *,
+        animal: str = "Red Fox",
+        completion_after: int = 5,
+    ) -> None:
+        self._turns = list(turns) if turns is not None else []
+        self._animal = animal
+        self._completion_after = completion_after
+        self.next_turn_calls: list[int] = []
+        self.final_turn_calls: list[int] = []
+
+    def next_turn(self, dossier) -> InterviewTurn:
+        self.next_turn_calls.append(dossier.asked)
+        if self._turns:
+            return self._turns.pop(0)
+        if dossier.asked >= self._completion_after:
+            return self._complete()
+        return InterviewTurn(next_question=f"Question {dossier.asked + 1}?")
+
+    def final_turn(self, dossier) -> InterviewTurn:
+        self.final_turn_calls.append(dossier.asked)
+        return self._complete()
+
+    def _complete(self) -> InterviewTurn:
+        return InterviewTurn(
+            is_complete=True,
+            suggested_animal=self._animal,
+            animal_rationale="scripted",
+        )
+
+
+class ExplodingInterviewer:
+    """`Interviewer` double that models a Gemini/ADK failure mid-interview."""
+
+    def next_turn(self, dossier) -> InterviewTurn:
+        raise RuntimeError("gemini 500")
+
+    def final_turn(self, dossier) -> InterviewTurn:
+        raise RuntimeError("gemini 500")

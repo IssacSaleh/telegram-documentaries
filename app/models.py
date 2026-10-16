@@ -7,7 +7,9 @@ performs I/O; it only validates.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TelegramChat(BaseModel):
@@ -88,3 +90,82 @@ class BouncerVerdict(BaseModel):
     human_present: bool
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     reason: str = Field(default="")
+
+
+class DossierAnswer(BaseModel):
+    """One Q/A pair in the interview dossier."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    question: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_non_empty(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for k in ("question", "answer"):
+                v = data.get(k)
+                if isinstance(v, str):
+                    v = v.strip()
+                    data[k] = v
+                    if not v:
+                        # Trigger min_length failure by passing empty string
+                        continue
+        return data
+
+
+class Dossier(BaseModel):
+    """Per-chat interview dossier accumulated over turns."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    answers: list[DossierAnswer] = Field(default_factory=list)
+    follow_ups_used: int = Field(default=0, ge=0)
+    suggested_animal: str | None = None
+    animal_rationale: str | None = None
+
+    @property
+    def asked(self) -> int:
+        """Number of questions asked so far (derived from answers)."""
+        return len(self.answers)
+
+
+class InterviewTurn(BaseModel):
+    """Structured output from the Interviewer per turn."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    next_question: str | None = None
+    is_complete: bool = False
+    is_follow_up: bool = False
+    suggested_animal: str | None = None
+    animal_rationale: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_cross_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            is_complete = data.get("is_complete", False)
+            next_question = data.get("next_question")
+            suggested_animal = data.get("suggested_animal")
+
+            if is_complete:
+                if suggested_animal is None or (
+                    isinstance(suggested_animal, str) and not suggested_animal.strip()
+                ):
+                    raise ValueError(
+                        "suggested_animal is required when is_complete is true"
+                    )
+            else:
+                if next_question is None or (
+                    isinstance(next_question, str) and not next_question.strip()
+                ):
+                    raise ValueError(
+                        "next_question is required when not complete"
+                    )
+                if suggested_animal is not None and str(suggested_animal).strip():
+                    raise ValueError(
+                        "suggested_animal must be null when not complete"
+                    )
+        return data

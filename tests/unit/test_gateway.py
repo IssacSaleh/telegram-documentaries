@@ -1,9 +1,10 @@
-"""The gateway's reply behaviour.
+"""The gateway's phase-aware reply behaviour.
 
-User requirement: "When I send a message to the Telegram bot on my phone the
-bot should reply with a hardcoded message such as 'hey mate!' (no API calls
-just yet). Every time we send a message, the same hardcoded message should be
-sent back."
+Phase 1's hardcoded reply has been superseded by the pipeline's real
+conversation (SPECS/2026-10-16-interviewer, decision D4): text with no
+session now prompts for a photo, and the reply is driven by the chat's
+phase. Phase 1's routing guarantees (session registration, `/start` purge,
+batch isolation, quiet failures) still hold and are asserted below.
 """
 
 from __future__ import annotations
@@ -15,17 +16,24 @@ import pytest
 
 from app.bouncer import REJECTION_REPLY
 from app.gateway import (
-    ReplyPolicy,
     TelegramSender,
     handle_update,
     poll_once,
     run,
 )
+from app.interviewer import (
+    CONFIRMATION_PROMPT,
+    PHOTO_PROMPT,
+    PORTRAIT_PENDING_REPLY,
+    WRONG_PAYLOAD_PROMPT,
+)
 from app.models import OutboundMessage, TelegramUpdate
+from app.state import SessionPhase, get_store
 from tests.conftest import (
     ExplodingClassifier,
     ExplodingPhotoFetcher,
     FakeClassifier,
+    FakeInterviewer,
     FakePhotoFetcher,
     RecordingSender,
     human_verdict,
@@ -63,42 +71,50 @@ def _photo_update(chat_id: int = 555, update_id: int = 2) -> TelegramUpdate:
     )
 
 
-class TestHardcodedReply:
-    def test_replies_with_the_hardcoded_message(self) -> None:
+class TestTextWithoutSession:
+    """D4: text from a chat with no interview in progress prompts for a photo."""
+
+    def test_prompts_for_a_photo(self) -> None:
         outbound = handle_update(_update("hello there"))
 
         assert outbound is not None
-        assert outbound.text == "hey mate!"
+        assert outbound.text == PHOTO_PROMPT
         assert outbound.chat_id == 555
 
-    def test_reply_is_identical_every_time(self) -> None:
-        """'Every time we send a message, the same hardcoded message back.'"""
+    def test_prompt_is_identical_every_time(self) -> None:
         texts = [handle_update(_update(f"msg {i}")).text for i in range(5)]  # type: ignore[union-attr]
 
-        assert texts == ["hey mate!"] * 5
+        assert texts == [PHOTO_PROMPT] * 5
 
-    def test_reply_does_not_echo_the_users_input(self) -> None:
+    def test_prompt_does_not_echo_the_users_input(self) -> None:
         outbound = handle_update(_update("a completely different sentence"))
 
         assert outbound is not None
-        assert outbound.text == "hey mate!"
+        assert outbound.text == PHOTO_PROMPT
         assert "different" not in outbound.text
 
     @pytest.mark.parametrize(
         "text",
         ["", " ", "hey mate!", "úñîçödé 🦁", "line\nbreak", "x" * 4096],
     )
-    def test_reply_is_the_same_for_any_user_text(self, text: str) -> None:
+    def test_prompt_is_the_same_for_any_user_text(self, text: str) -> None:
         outbound = handle_update(_update(text))
 
         assert outbound is not None
-        assert outbound.text == "hey mate!"
+        assert outbound.text == PHOTO_PROMPT
 
-    def test_reply_targets_the_chats_own_id(self) -> None:
+    def test_prompt_targets_the_chats_own_id(self) -> None:
         outbound = handle_update(_update(chat_id=999888777))
 
         assert outbound is not None
         assert outbound.chat_id == 999888777
+
+    def test_no_session_is_created_by_bare_text(self) -> None:
+        """A chat that has not sent a photo is not "in" anything; registering
+        it would make the store lie about who is waiting."""
+        handle_update(_update(chat_id=34234))
+
+        assert 34234 not in get_store().chat_ids
 
 
 class TestWrongPayloadAtWrongStage:
@@ -135,47 +151,69 @@ class TestWrongPayloadAtWrongStage:
 
 
 class TestSessionRegistration:
-    def test_incoming_chat_is_registered_with_the_shared_state_driver(self) -> None:
-        from app.state import SessionPhase, get_store
+    def test_an_admitted_photo_registers_the_chat(self) -> None:
+        """A chat is only "in" the pipeline once the Bouncer admits its photo."""
+        store = get_store()
 
-        get_store().reset(555)
-        handle_update(_update(chat_id=555))
+        handle_update(
+            _photo_update(555),
+            RecordingSender(),
+            fetcher=FakePhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
+        )
 
-        session = get_store().get_or_create(555)
+        session = store.get(555)
+        assert session is not None
         assert session.chat_id == 555
-        assert session.phase is SessionPhase.AWAITING_PHOTO
+        assert session.phase is SessionPhase.AWAITING_CONFIRMATION
 
     def test_registration_is_per_chat(self) -> None:
-        from app.state import get_store
+        store = get_store()
 
-        get_store().reset(101)
-        get_store().reset(202)
+        for chat_id in (101, 202):
+            handle_update(
+                _photo_update(chat_id),
+                RecordingSender(),
+                fetcher=FakePhotoFetcher(),
+                classifier=FakeClassifier(human_verdict()),
+                interviewer=FakeInterviewer(),
+            )
 
-        handle_update(_update(chat_id=101))
-        handle_update(_update(chat_id=202))
-
-        assert {101, 202}.issubset(get_store().chat_ids)
+        assert {101, 202}.issubset(store.chat_ids)
 
 
 class TestRestartCommand:
     @pytest.mark.parametrize("command", ["/start", "/restart"])
     def test_restart_commands_purge_state_and_still_reply(self, command: str) -> None:
         """MISSION: /start and /restart purge state without restarting."""
-        from app.state import get_store
-
-        get_store().reset(555)
-        get_store().get_or_create(555)
+        store = get_store()
+        store.get_or_create(555)
 
         outbound = handle_update(_update(command, chat_id=555))
 
         assert outbound is not None
-        assert outbound.text == "hey mate!"
-        assert 555 not in get_store().chat_ids
+        assert outbound.text == PHOTO_PROMPT
+        assert 555 not in store.chat_ids
 
+    @pytest.mark.parametrize("command", ["/start", "/restart"])
+    def test_purges_a_mid_interview_dossier(self, command: str) -> None:
+        """A reset mid-interview must wipe the dossier, not merely move on."""
+        store = get_store()
+        interviewer = FakeInterviewer()
+        handle_update(
+            _photo_update(555),
+            RecordingSender(),
+            fetcher=FakePhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=555), interviewer=interviewer)
+        assert store.get(555) is not None and store.get(555).dossier is not None
 
-class TestReplyPolicy:
-    def test_policy_exposes_the_hardcoded_text(self) -> None:
-        assert ReplyPolicy.HARDCODED_REPLY == "hey mate!"
+        handle_update(_update(command, chat_id=555))
+
+        assert store.get(555) is None
 
 
 class TestReplyIsAuditable:
@@ -265,7 +303,7 @@ class TestResetCommandMatching:
         outbound = handle_update(_update(text, chat_id=555))
 
         assert outbound is not None
-        assert outbound.text == "hey mate!"
+        assert outbound.text == PHOTO_PROMPT
         assert 555 not in get_store().chat_ids, f"{text!r} must reset the session"
 
     @pytest.mark.parametrize("text", ["/start some args", "/restart arg1 arg2"])
@@ -401,13 +439,36 @@ class TestWiredBouncerEndToEnd:
             sender,
             fetcher=FakePhotoFetcher(),
             classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
         )
 
         assert reply is not None
-        assert reply.text == ReplyPolicy.HARDCODED_REPLY
+        assert reply.text == CONFIRMATION_PROMPT
         assert reply.chat_id == 900
         assert sender.sent == [reply], "exactly one reply goes out"
-        assert store.get(900) is not None, "admission continues the flow"
+        session = store.get(900)
+        assert session is not None, "admission continues the flow"
+        assert session.phase is SessionPhase.AWAITING_CONFIRMATION
+        assert session.dossier is not None, "a fresh dossier is started"
+
+    def test_admitted_photo_without_an_interviewer_degrades_friendly(self) -> None:
+        """A failed Interviewer init must not leave the admitted user in
+        silence (TECH error policy)."""
+        from app.gateway import BouncerFallbackPolicy
+
+        sender = RecordingSender()
+
+        reply = handle_update(
+            _photo_update(902),
+            sender,
+            fetcher=FakePhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=None,
+        )
+
+        assert reply is not None
+        assert reply.text == BouncerFallbackPolicy.ERROR_REPLY
+        assert sender.sent == [reply]
 
     def test_rejected_photo_gets_the_rejection_reply_sent_and_state_reset(self) -> None:
         from app.state import get_store
@@ -421,6 +482,7 @@ class TestWiredBouncerEndToEnd:
             sender,
             fetcher=FakePhotoFetcher(),
             classifier=FakeClassifier(no_human_verdict()),
+            interviewer=FakeInterviewer(),
         )
 
         assert reply is not None
@@ -428,6 +490,154 @@ class TestWiredBouncerEndToEnd:
         assert reply.chat_id == 901
         assert sender.sent == [reply], "exactly one rejection goes out"
         assert store.get(901) is None, "rejection purges that chat's state"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 routing: confirmation, answering, the DONE phase, wrong payloads
+# ---------------------------------------------------------------------------
+
+
+class TestInterviewRouting:
+    def _admit(self, sender, chat_id: int, interviewer: FakeInterviewer) -> None:
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+
+    def test_yes_starts_the_interview_and_sends_the_first_question(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 600, interviewer)
+        sender.sent.clear()
+
+        reply = handle_update(
+            _update("yes", chat_id=600), sender, interviewer=interviewer
+        )
+
+        assert reply is not None
+        assert reply.text == "Question 1?"
+        assert sender.sent == [reply]
+        assert store.get(600).phase is SessionPhase.INTERVIEWING
+        assert store.get(600).pending_question == "Question 1?"
+
+    @pytest.mark.parametrize("text", ["maybe", "nope", "Y E S", "", "   "])
+    def test_anything_but_yes_re_asks_the_confirmation(self, text: str) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 601, interviewer)
+        sender.sent.clear()
+
+        reply = handle_update(_update(text, chat_id=601), sender, interviewer=interviewer)
+
+        assert reply is not None
+        assert reply.text == CONFIRMATION_PROMPT
+        assert store.get(601).phase is SessionPhase.AWAITING_CONFIRMATION
+        assert interviewer.next_turn_calls == [], "no interview before YES"
+
+    @pytest.mark.parametrize("text", ["yes", "YES", "Yes", " y ", "Y", "y"])
+    def test_confirmation_is_case_insensitive_and_trimmed(self, text: str) -> None:
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        chat_id = 602 + len(text)  # unique chat per case
+        self._admit(sender, chat_id, interviewer)
+
+        reply = handle_update(_update(text, chat_id=chat_id), sender, interviewer=interviewer)
+
+        assert reply is not None
+        assert get_store().get(chat_id).phase is SessionPhase.INTERVIEWING
+
+    def test_an_answer_is_recorded_and_the_next_question_asked(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 603, interviewer)
+        handle_update(_update("yes", chat_id=603), sender, interviewer=interviewer)
+
+        reply = handle_update(
+            _update("I like long walks", chat_id=603), sender, interviewer=interviewer
+        )
+
+        assert reply is not None
+        assert reply.text == "Question 2?"
+        dossier = store.get(603).dossier
+        assert dossier is not None
+        assert dossier.asked == 1
+        assert dossier.answers[0].answer == "I like long walks"
+        assert store.get(603).pending_question == "Question 2?"
+
+    def test_done_phase_points_ahead_to_the_portrait(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        self._admit(sender, 604, interviewer)
+        handle_update(_update("yes", chat_id=604), sender, interviewer=interviewer)
+        # Five answers is the minimum interview length.
+        for _ in range(5):
+            handle_update(_update("an answer", chat_id=604), sender, interviewer=interviewer)
+        assert store.get(604).phase is SessionPhase.DONE
+
+        reply = handle_update(_update("what now?", chat_id=604), sender, interviewer=interviewer)
+
+        assert reply is not None
+        assert reply.text == PORTRAIT_PENDING_REPLY
+
+    def test_a_stray_photo_mid_interview_nudges_instead_of_silence(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 605, interviewer)
+        handle_update(_update("yes", chat_id=605), sender, interviewer=interviewer)
+        sender.sent.clear()
+
+        reply = handle_update(_photo_update(605, update_id=99), sender, interviewer=interviewer)
+
+        assert reply is not None
+        assert reply.text == WRONG_PAYLOAD_PROMPT
+        assert sender.sent == [reply]
+        assert store.get(605).pending_question == "Question 1?", (
+            "the open question must survive a wrong payload"
+        )
+
+    def test_a_stray_sticker_mid_confirmation_nudges(self) -> None:
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 606, interviewer)
+
+        sticker = TelegramUpdate.model_validate(
+            {
+                "update_id": 50,
+                "message": {
+                    "message_id": 50,
+                    "date": 1,
+                    "chat": {"id": 606, "type": "private"},
+                    "sticker": {"file_id": "s", "file_unique_id": "u",
+                                "width": 512, "height": 512, "type": "regular"},
+                },
+            }
+        )
+
+        reply = handle_update(sticker, sender, interviewer=interviewer)
+
+        assert reply is not None
+        assert reply.text == WRONG_PAYLOAD_PROMPT
+
+    def test_text_mid_interview_without_a_wired_interviewer_degrades(self) -> None:
+        from app.gateway import BouncerFallbackPolicy
+
+        store = get_store()
+        sender = RecordingSender()
+        self._admit(sender, 607, FakeInterviewer())
+        store.get(607).phase = SessionPhase.INTERVIEWING
+
+        reply = handle_update(_update("an answer", chat_id=607), sender, interviewer=None)
+
+        assert reply is not None, "never leave a user mid-interview in silence"
+        assert reply.text == BouncerFallbackPolicy.ERROR_REPLY
 
 
 # ---------------------------------------------------------------------------

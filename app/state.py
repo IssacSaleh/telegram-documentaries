@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from enum import Enum, auto
 from threading import RLock
 
+from app.models import Dossier
+
 
 class SessionPhase(Enum):
     """Named state-machine phases (SPECS/TECH.md, "State machine phases").
@@ -28,6 +30,7 @@ class SessionPhase(Enum):
     """
 
     AWAITING_PHOTO = auto()
+    AWAITING_CONFIRMATION = auto()
     INTERVIEWING = auto()
     GENERATING_IMAGE = auto()
     SCRIPTING = auto()
@@ -37,7 +40,7 @@ class SessionPhase(Enum):
 
 #: Version of the per-chat session schema. Bump on a breaking shape change so
 #: stale in-memory sessions are recognisably obsolete.
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -53,6 +56,8 @@ class Session:
     updated_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    dossier: Dossier | None = None
+    pending_question: str | None = None
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)
@@ -85,6 +90,26 @@ class SessionStore:
     def get(self, chat_id: int) -> Session | None:
         with self._lock:
             return self._sessions.get(chat_id)
+
+    def start_dossier(self, chat_id: int) -> Dossier:
+        """Start a fresh dossier for the given chat."""
+        with self._lock:
+            session = self._sessions.get(chat_id)
+            if session is None:
+                session = Session(chat_id=chat_id)
+                self._sessions[chat_id] = session
+            dossier = Dossier()
+            session.dossier = dossier
+            session.touch()
+            return dossier
+
+    def get_dossier(self, chat_id: int) -> Dossier | None:
+        """Get the dossier for the given chat if it exists."""
+        with self._lock:
+            session = self._sessions.get(chat_id)
+            if session is None:
+                return None
+            return session.dossier
 
     def reset(self, chat_id: int) -> None:
         """Purge one chat's state. Idempotent; never raises on unknown chats.

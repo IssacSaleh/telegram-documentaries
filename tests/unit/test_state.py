@@ -18,6 +18,7 @@ class TestPhaseEnum:
     def test_expected_phases_exist_in_order(self) -> None:
         assert [p.name for p in SessionPhase] == [
             "AWAITING_PHOTO",
+            "AWAITING_CONFIRMATION",
             "INTERVIEWING",
             "GENERATING_IMAGE",
             "SCRIPTING",

@@ -122,6 +122,118 @@ class TestPhotoSizes:
             OutboundMessage(chat_id=1, text="")
 
 
+class TestInterviewTurn:
+    def test_accepts_normal_incomplete_turn(self) -> None:
+        from app.models import InterviewTurn
+
+        turn = InterviewTurn.model_validate(
+            {
+                "next_question": "Tell me about your favourite hobby.",
+                "is_complete": False,
+            }
+        )
+        assert turn.next_question == "Tell me about your favourite hobby."
+        assert turn.is_complete is False
+        assert turn.suggested_animal is None
+
+    def test_accepts_complete_turn_with_animal(self) -> None:
+        from app.models import InterviewTurn
+
+        turn = InterviewTurn.model_validate(
+            {
+                "next_question": None,
+                "is_complete": True,
+                "suggested_animal": "Red Fox",
+                "animal_rationale": "Cunning and adaptable",
+            }
+        )
+        assert turn.is_complete is True
+        assert turn.suggested_animal == "Red Fox"
+
+    def test_rejects_complete_without_animal(self) -> None:
+        from pydantic import ValidationError
+
+        from app.models import InterviewTurn
+
+        with pytest.raises(ValidationError):
+            InterviewTurn.model_validate(
+                {
+                    "next_question": None,
+                    "is_complete": True,
+                    "suggested_animal": None,
+                }
+            )
+
+    def test_rejects_incomplete_with_animal(self) -> None:
+        from pydantic import ValidationError
+
+        from app.models import InterviewTurn
+
+        with pytest.raises(ValidationError):
+            InterviewTurn.model_validate(
+                {
+                    "next_question": "What next?",
+                    "is_complete": False,
+                    "suggested_animal": "Fox",
+                }
+            )
+
+    def test_rejects_empty_next_question_when_incomplete(self) -> None:
+        from pydantic import ValidationError
+
+        from app.models import InterviewTurn
+
+        with pytest.raises(ValidationError):
+            InterviewTurn.model_validate(
+                {
+                    "next_question": "",
+                    "is_complete": False,
+                }
+            )
+
+    def test_rejects_whitespace_only_next_question_when_incomplete(self) -> None:
+        from pydantic import ValidationError
+
+        from app.models import InterviewTurn
+
+        with pytest.raises(ValidationError):
+            InterviewTurn.model_validate(
+                {
+                    "next_question": "   ",
+                    "is_complete": False,
+                }
+            )
+
+
+class TestDossier:
+    def test_dossier_preserves_answer_order(self) -> None:
+        from app.models import Dossier, DossierAnswer
+
+        dossier = Dossier(
+            answers=[
+                DossierAnswer(question="Q1", answer="A1"),
+                DossierAnswer(question="Q2", answer="A2"),
+                DossierAnswer(question="Q3", answer="A3"),
+            ]
+        )
+        assert dossier.asked == 3
+        assert dossier.answers[0].question == "Q1"
+        assert dossier.answers[1].answer == "A2"
+
+    def test_asked_is_derived(self) -> None:
+        from app.models import Dossier, DossierAnswer
+
+        dossier = Dossier(answers=[DossierAnswer(question="Q", answer="A")])
+        assert dossier.asked == 1
+
+    def test_follow_ups_used_defaults_to_zero(self) -> None:
+        from app.models import Dossier
+
+        dossier = Dossier()
+        assert dossier.follow_ups_used == 0
+        assert dossier.suggested_animal is None
+
+
 _PHOTO_UPDATE = {
     "update_id": 42,
     "message": {

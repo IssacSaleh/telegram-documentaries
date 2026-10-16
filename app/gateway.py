@@ -3,15 +3,22 @@
 Phase 1 introduced the long-polling loop and the hardcoded text reply.
 Phase 2 added **the Bouncer**: photo updates are downloaded and classified
 by Gemini 3.1 Flash Lite (via Google ADK) to decide whether a human is
-present. Non-human submissions get a cheeky rejection and a state reset;
-humans continue the confirmation flow unchanged.
+present. Non-human submissions get a cheeky rejection and a state reset.
+Phase 3 adds **the Interviewer**: an admitted human is invited to be
+interviewed, then guided through 5–7 questions to a suggested animal.
 
-A Bouncer failure (fetch, classification, or ADK not wired) degrades to a
-friendly reply — the user is never left in silence (SPECS/TECH.md error
-policy).
+Routing is driven by the chat's phase (SPECS/2026-10-16-interviewer):
 
-Text behaviour is unchanged from Phase 1 — every text message still gets
-the same hardcoded reply.
+  * **photo**  -> the Bouncer. Admitted humans enter the confirmation flow;
+    rejections reset the chat.
+  * **text**   -> phase-aware: no session gets the "send a photo" prompt;
+    AWAITING_CONFIRMATION starts the interview on YES; INTERVIEWING records
+    an answer and asks the next question; DONE points ahead to the portrait.
+  * **other**  -> mid-interview, a gentle "answer in words"; otherwise logged
+    and ignored.
+
+Any failure (fetch, classification, ADK not wired) degrades to a friendly
+reply — the user is never left in silence (SPECS/TECH.md error policy).
 """
 
 from __future__ import annotations
@@ -23,12 +30,23 @@ from pydantic import ValidationError
 
 from app.bouncer import BOUNCER_MODEL, bounce
 from app.config import TELEGRAM_API, telegram_payload
+from app.interviewer import (
+    INTERVIEWER_MODEL,
+    PHOTO_PROMPT,
+    AdkInterviewer,
+    handle_answer,
+    handle_confirmation,
+    handle_photo_admitted,
+    handle_portrait_pending,
+    handle_wrong_payload,
+)
 from app.logging_utils import get_logger, logged
 from app.models import OutboundMessage, TelegramUpdate
-from app.state import get_store
+from app.state import SessionPhase, get_store
 
 if TYPE_CHECKING:
     from app.bouncer import HumanPresenceClassifier, PhotoFetcher
+    from app.interviewer import Interviewer
 
 logger = get_logger("gateway")
 
@@ -37,11 +55,10 @@ logger = get_logger("gateway")
 #: restarting the process."
 RESET_COMMANDS = frozenset({"/start", "/restart"})
 
+#: Phases in which a stray non-text payload is worth a gentle nudge, because
+#: the user is meant to be typing an answer or a YES.
+_ANSWER_PHASES = frozenset({SessionPhase.AWAITING_CONFIRMATION, SessionPhase.INTERVIEWING})
 
-class ReplyPolicy:
-    """The hardcoded reply. Phase 1 has exactly one, by design."""
-
-    HARDCODED_REPLY = "hey mate!"
 
 
 class BouncerFallbackPolicy:
@@ -89,6 +106,17 @@ def _send_bouncer_fallback(
     return reply
 
 
+def _send(
+    chat_id: int, text: str, sender: MessageSender | None, *, event: str
+) -> OutboundMessage:
+    """Send a plain reply and return it. The single reply choke point."""
+    reply = OutboundMessage(chat_id=chat_id, text=text)
+    if sender is not None:
+        sender.send(reply)
+    logger.info("event=replied chat_id=%s via=%s", chat_id, event)
+    return reply
+
+
 @logged(logger, event="handle_update")
 def handle_update(
     update: TelegramUpdate,
@@ -96,17 +124,24 @@ def handle_update(
     *,
     fetcher: PhotoFetcher | None = None,
     classifier: HumanPresenceClassifier | None = None,
+    interviewer: Interviewer | None = None,
 ) -> OutboundMessage | None:
     """Turn one validated update into at most one outbound reply.
 
-    Routing:
+    Routing is phase-aware (SPECS/2026-10-16-interviewer):
+
+      * **reset commands** (`/start`, `/restart`) purge the chat in *any*
+        phase and then point the user at the photo flow.
       * **photo**  -> the Bouncer (Phase 2) gates it. Rejection is sent and
-        the chat's ephemeral state is purged; an admission falls through to
-        the existing confirmation flow *unchanged*. A Bouncer failure sends
-        a friendly fallback reply without touching state.
-      * **text**   -> Phase 1 behaviour: hardcoded reply, plus `/start` and
-        `/restart` resets.
-      * anything else -> logged and ignored.
+        the chat's ephemeral state is purged; an admission invites an
+        interview. A Bouncer failure sends a friendly fallback without
+        touching state.
+      * **text**   -> no session (or AWAITING_PHOTO) gets the "send a photo"
+        prompt and creates NO session; AWAITING_CONFIRMATION starts the
+        interview on YES and re-asks otherwise; INTERVIEWING records the
+        answer and asks the next question; later phases point at the portrait.
+      * anything else -> a "answer in words" nudge mid-interview, else logged
+        and ignored.
 
     The optional ``sender`` performs the actual transport. Returns the reply
     so callers (and tests) can observe it.
@@ -118,9 +153,30 @@ def handle_update(
 
     chat_id = message.chat.id
     text = message.text
+    store = get_store()
 
-    # ---- Phase 2: photo -> Bouncer -------------------------------------
+    # ---- Reset commands: valid in any phase ----------------------------
+    if text is not None and _command_token(text) in RESET_COMMANDS:
+        command = _command_token(text)
+        store.reset(chat_id)
+        logger.info("event=state_reset command=%r chat_id=%s", command, chat_id)
+        # A reset leaves no session, so the next step is a photo again.
+        return _send(chat_id, PHOTO_PROMPT, sender, event="state_reset")
+
+    session = store.get(chat_id)
+    answering = session is not None and session.phase in _ANSWER_PHASES
+
+    # ---- Photo -> Bouncer, unless an interview is in progress ----------
     if message.largest_photo() is not None:
+        if answering:
+            # D5: mid-interview a photo is a mistake, not a new submission.
+            # Nudge, keep the pending question, and never call the model.
+            decision = handle_wrong_payload(chat_id)
+            if sender is not None:
+                sender.send(decision.reply)
+            logger.info("event=replied chat_id=%s via=wrong_payload", chat_id)
+            return decision.reply
+
         if fetcher is None or classifier is None:
             # Not wired (ADK failed to initialise, or a unit test exercising
             # the text path only). The user still gets a friendly reply.
@@ -131,52 +187,87 @@ def handle_update(
                 chat_id, sender, reason="bouncer_not_wired"
             )
 
-        decision = bounce(update, fetcher=fetcher, classifier=classifier)
+        bouncer_decision = bounce(update, fetcher=fetcher, classifier=classifier)
 
-        if decision.error:
+        if bouncer_decision.error:
             # bounce() already logged the underlying failure loudly; degrade
             # gracefully with a friendly reply — never stall (TECH policy).
             logger.error("event=bouncer_error chat_id=%s", chat_id)
             return _send_bouncer_fallback(chat_id, sender, reason="bouncer_error")
 
-        if decision.reply is not None:
+        if bouncer_decision.reply is not None:
             # Rejection: bounce() already reset this chat's state.
             if sender is not None:
-                sender.send(decision.reply)
-            return decision.reply
+                sender.send(bouncer_decision.reply)
+            return bouncer_decision.reply
 
-        # Admitted — continue the confirmation flow unchanged.
-        get_store().get_or_create(chat_id)
-        reply = OutboundMessage(chat_id=chat_id, text=ReplyPolicy.HARDCODED_REPLY)
+        # Admitted: invite the interview.
+        if interviewer is None:
+            logger.warning(
+                "event=skipped reason=interviewer_not_wired chat_id=%s", chat_id
+            )
+            return _send_bouncer_fallback(
+                chat_id, sender, reason="interviewer_not_wired"
+            )
+        admission = handle_photo_admitted(chat_id)
         if sender is not None:
-            sender.send(reply)
+            sender.send(admission.reply)
         logger.info("event=replied chat_id=%s via=bouncer_admission", chat_id)
-        return reply
+        return admission.reply
 
+    # ---- Non-text, non-photo ------------------------------------------
     if text is None:
-        # Some other non-text payload at AWAITING_PHOTO. Log it; do not crash.
+        if answering:
+            # The user is expected to be typing; nudge instead of silence.
+            decision = handle_wrong_payload(chat_id)
+            if sender is not None:
+                sender.send(decision.reply)
+            logger.info("event=replied chat_id=%s via=wrong_payload", chat_id)
+            return decision.reply
         logger.info("event=skipped reason=non_text chat_id=%s", chat_id)
         return None
 
-    # ---- Phase 1: text path --------------------------------------------
-    store = get_store()
+    # ---- Text: phase-aware --------------------------------------------
+    if session is None or session.phase == SessionPhase.AWAITING_PHOTO:
+        # No interview in progress: point at the photo flow. Creating no
+        # session keeps the store honest about who is actually waiting.
+        return _send(chat_id, PHOTO_PROMPT, sender, event="awaiting_photo")
 
-    command = _command_token(text)
-    if command in RESET_COMMANDS:
-        store.reset(chat_id)
-        logger.info("event=state_reset command=%r chat_id=%s", command, chat_id)
-    else:
-        store.get_or_create(chat_id)
+    if session.phase == SessionPhase.AWAITING_CONFIRMATION:
+        if interviewer is None:
+            logger.warning(
+                "event=skipped reason=interviewer_not_wired chat_id=%s", chat_id
+            )
+            return _send_bouncer_fallback(
+                chat_id, sender, reason="interviewer_not_wired"
+            )
+        decision = handle_confirmation(chat_id, text, interviewer)
+        if sender is not None:
+            sender.send(decision.reply)
+        logger.info("event=replied chat_id=%s via=interview_confirmation", chat_id)
+        return decision.reply
 
-    reply = OutboundMessage(chat_id=chat_id, text=ReplyPolicy.HARDCODED_REPLY)
+    if session.phase == SessionPhase.INTERVIEWING:
+        if interviewer is None:
+            logger.warning(
+                "event=skipped reason=interviewer_not_wired chat_id=%s", chat_id
+            )
+            return _send_bouncer_fallback(
+                chat_id, sender, reason="interviewer_not_wired"
+            )
+        decision = handle_answer(chat_id, text, interviewer)
+        if sender is not None:
+            sender.send(decision.reply)
+        logger.info("event=replied chat_id=%s via=interview_answer", chat_id)
+        return decision.reply
 
+    # DONE and any later pipeline phase: the portrait comes next.
+    decision = handle_portrait_pending(chat_id)
     if sender is not None:
-        sender.send(reply)
+        sender.send(decision.reply)
+    logger.info("event=replied chat_id=%s via=portrait_pending", chat_id)
+    return decision.reply
 
-    # A reply is a user-visible side effect — log it at INFO so operators can
-    # audit what the bot actually sent without turning on DEBUG.
-    logger.info("event=replied chat_id=%s", chat_id)
-    return reply
 
 
 class TelegramSender:
@@ -234,6 +325,7 @@ def poll_once(
     *,
     fetcher: PhotoFetcher | None = None,
     classifier: HumanPresenceClassifier | None = None,
+    interviewer: Interviewer | None = None,
 ) -> int:
     """Fetch one batch of updates, reply to each, return the next offset.
 
@@ -287,7 +379,13 @@ def poll_once(
         next_offset = max(next_offset, update.update_id + 1)
 
         try:
-            handle_update(update, sender, fetcher=fetcher, classifier=classifier)
+            handle_update(
+                update,
+                sender,
+                fetcher=fetcher,
+                classifier=classifier,
+                interviewer=interviewer,
+            )
         except Exception:
             # Isolated: log loudly, keep answering the rest of the batch.
             logger.exception("event=update_failed update_id=%s", update.update_id)
@@ -312,12 +410,23 @@ def run(token: str) -> None:
             logger.exception("event=bouncer_init_failed")
             classifier = None  # photos degrade to "not wired" instead of crashing
 
+        # The Interviewer is wired the same way, independently: a Bouncer that
+        # failed to initialise must not take the Interviewer down with it.
+        try:
+            interviewer: Interviewer | None = AdkInterviewer()
+        except Exception:
+            logger.exception("event=interviewer_init_failed")
+            interviewer = None  # text mid-interview degrades gracefully
+
         logger.info(
             "event=gateway_started transport=long_polling tracked_chats=%d "
-            "bouncer_model=%s bouncer_wired=%s",
+            "bouncer_model=%s bouncer_wired=%s interviewer_model=%s "
+            "interviewer_wired=%s",
             len(store.chat_ids),
             BOUNCER_MODEL,
             classifier is not None,
+            INTERVIEWER_MODEL,
+            interviewer is not None,
         )
 
         offset = 0
@@ -330,6 +439,7 @@ def run(token: str) -> None:
                     sender=sender,
                     fetcher=fetcher,
                     classifier=classifier,
+                    interviewer=interviewer,
                 )
             except httpx.HTTPError:
                 # Log loudly, keep polling (SPECS/TECH.md error policy).
