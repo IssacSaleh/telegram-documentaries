@@ -424,3 +424,20 @@ class TestAdkResponseParsing:
         assert verdict.human_present is True
         assert verdict.confidence == 0.97
         assert verdict.reason == "a clear portrait"
+
+    def test_only_the_first_complete_object_is_extracted(self) -> None:
+        """Braces inside values and strays in trailing prose must not drag
+        the extraction across the whole response."""
+        from app.bouncer import _extract_json
+
+        text = (
+            'Verdict: {"human_present": true, "confidence": 0.9, '
+            '"reason": "a man with a {curly} beard"} — a human, '
+            "closing with a stray } and a mention of {objects}."
+        )
+
+        verdict = BouncerVerdict.model_validate_json(_extract_json(text))
+
+        assert verdict.human_present is True
+        assert verdict.confidence == 0.9
+        assert verdict.reason == "a man with a {curly} beard"
