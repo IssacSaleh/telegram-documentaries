@@ -121,7 +121,7 @@ class TelegramPhotoFetcher:
 
         path = info["result"]["file_path"]
         response = self._client.get(
-            f"{TELEGRAM_API}/bot{self._token}/file/{path}",
+            f"{TELEGRAM_API}/file/bot{self._token}/{path.lstrip('/')}",
             timeout=60.0,
         )
         if not response.is_success:

@@ -18,6 +18,7 @@ from app.bouncer import (
     REJECTION_REPLY,
     AdkHumanPresenceClassifier,
     BouncerDecision,
+    TelegramPhotoFetcher,
     bounce,
 )
 from app.models import BouncerVerdict, TelegramUpdate
@@ -441,3 +442,131 @@ class TestAdkResponseParsing:
         assert verdict.human_present is True
         assert verdict.confidence == 0.9
         assert verdict.reason == "a man with a {curly} beard"
+
+
+# ---------------------------------------------------------------------------
+# Telegram photo download URLs (regression: live 404, offline tests green)
+# ---------------------------------------------------------------------------
+
+
+class _StubHttpResponse:
+    """Minimal httpx.Response look-alike — only what the fetcher touches."""
+
+    def __init__(self, status_code: int, body: bytes, content_type: str) -> None:
+        self.status_code = status_code
+        self.content = body
+        self.headers = {"content-type": content_type}
+        self.is_success = 200 <= status_code < 300
+
+    def json(self) -> dict:
+        import json as _json
+
+        return _json.loads(self.content)
+
+
+class _RecordingHttpClient:
+    """Stands in for httpx.Client; records (url, params) per call."""
+
+    def __init__(self, responses: list[_StubHttpResponse]) -> None:
+        self.calls: list[tuple[str, dict | None]] = []
+        self._responses = list(responses)
+
+    def get(self, url: str, params: dict | None = None, timeout: float | None = None):
+        self.calls.append((url, params))
+        if not self._responses:
+            raise AssertionError(f"unexpected extra GET: {url}")
+        return self._responses.pop(0)
+
+
+class TestTelegramPhotoFetcherUrls:
+    """Pin the two Telegram URL shapes the fetcher builds.
+
+    A wrong path here 404s on every real photo while every offline test
+    stays green (they use FakeFetcher) — which is exactly how the live
+    regression happened.
+    """
+
+    TOKEN = "123456:AAStubTokenNotReal"
+
+    def _fetcher(self, responses):
+        return TelegramPhotoFetcher(
+            token=self.TOKEN, client=_RecordingHttpClient(responses)
+        )
+
+    def test_getfile_is_called_on_the_api_endpoint(self) -> None:
+        fetcher = self._fetcher(
+            [
+                _StubHttpResponse(
+                    200,
+                    b'{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}',
+                    "application/json",
+                ),
+                _StubHttpResponse(200, b"\xff\xd8fakedata", "image/jpeg"),
+            ]
+        )
+
+        fetcher.fetch("file_id_abc")
+
+        getfile_url, params = fetcher._client.calls[0]
+        assert getfile_url == f"https://api.telegram.org/bot{self.TOKEN}/getFile"
+        assert params == {"file_id": "file_id_abc"}
+
+    def test_file_bytes_are_downloaded_from_the_file_endpoint(self) -> None:
+        """Telegram serves files at /file/bot<TOKEN>/<path>, NOT /bot<TOKEN>/file/."""
+        fetcher = self._fetcher(
+            [
+                _StubHttpResponse(
+                    200,
+                    b'{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}',
+                    "application/json",
+                ),
+                _StubHttpResponse(200, b"\xff\xd8fakedata", "image/jpeg"),
+            ]
+        )
+
+        fetcher.fetch("file_id_abc")
+
+        file_url, params = fetcher._client.calls[1]
+        assert file_url == (
+            f"https://api.telegram.org/file/bot{self.TOKEN}/photos/file_1.jpg"
+        )
+        assert params is None
+
+    def test_returns_bytes_and_mime_type(self) -> None:
+        fetcher = self._fetcher(
+            [
+                _StubHttpResponse(
+                    200,
+                    b'{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}',
+                    "application/json",
+                ),
+                _StubHttpResponse(200, b"\xff\xd8fakedata", "image/jpeg; charset=binary"),
+            ]
+        )
+
+        data, mime = fetcher.fetch("file_id_abc")
+
+        assert data == b"\xff\xd8fakedata"
+        assert mime == "image/jpeg"
+
+    def test_failed_download_raises_tokenless_error(self) -> None:
+        """404 must fail loudly but never echo the bot token (MISSION)."""
+        fetcher = self._fetcher(
+            [
+                _StubHttpResponse(
+                    200,
+                    b'{"ok":true,"result":{"file_path":"photos/file_1.jpg"}}',
+                    "application/json",
+                ),
+                _StubHttpResponse(404, b'{"ok":false,"description":"Not Found"}', "application/json"),
+            ]
+        )
+
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError) as exc_info:
+            fetcher.fetch("file_id_abc")
+
+        message = str(exc_info.value)
+        assert self.TOKEN not in message
+        assert "404" in message
