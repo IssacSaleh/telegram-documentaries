@@ -21,6 +21,13 @@ resets state. Text/image classification only — **no TTS, no video.**
 - **Acceptance:** a portrait passes through to the Interviewer; a non-human image
   gets a rejection reply and state resets; rejects are logged.
 - **Serves:** happy-path intake; graceful wrong-payload handling.
+- **Delivered:** the gate lives in `app/bouncer.py` as a Google ADK `LlmAgent`
+  (`gemini-3.1-flash-lite`, structured `BouncerVerdict`); a portrait is admitted
+  into the confirmation flow, a non-human is rejected and that chat's state is
+  purged, rejects are logged, and Bouncer failures degrade to a friendly reply.
+  Verified by 112 offline tests plus 3 live tests behind `RUN_LIVE_TESTS=1`
+  (portrait admitted; landscape rejected with reset; cross-chat isolation), and
+  `./scripts/hooks` clean.
 
 ## 3. Interviewer
 
