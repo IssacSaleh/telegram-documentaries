@@ -6,19 +6,26 @@ by Gemini 3.1 Flash Lite (via Google ADK) to decide whether a human is
 present. Non-human submissions get a cheeky rejection and a state reset.
 Phase 3 adds **the Interviewer**: an admitted human is invited to be
 interviewed, then guided through 5–7 questions to a suggested animal.
+Phase 4 adds **the Converter**: once the interview closes, the original
+photo, the dossier/personality summary, and the suggested animal go to
+Gemini 3.1 Flash Image in one multimodal request, and the hybrid portrait
+comes straight back to Telegram.
 
-Routing is driven by the chat's phase (SPECS/2026-10-16-interviewer):
+Routing is driven by the chat's phase (SPECS/2026-10-16-interviewer and
+SPECS/2026-10-17-converter):
 
   * **photo**  -> the Bouncer. Admitted humans enter the confirmation flow;
     rejections reset the chat.
   * **text**   -> phase-aware: no session gets the "send a photo" prompt;
     AWAITING_CONFIRMATION starts the interview on YES; INTERVIEWING records
-    an answer and asks the next question; DONE points ahead to the portrait.
+    an answer and asks the next question; DONE triggers the Converter, which
+    sends the portrait.
   * **other**  -> mid-interview, a gentle "answer in words"; otherwise logged
     and ignored.
 
-Any failure (fetch, classification, ADK not wired) degrades to a friendly
-reply — the user is never left in silence (SPECS/TECH.md error policy).
+Any failure (fetch, classification, conversion, ADK not wired) degrades to a
+friendly reply — the user is never left in silence (SPECS/TECH.md error
+policy).
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from pydantic import ValidationError
 
 from app.bouncer import BOUNCER_MODEL, bounce
 from app.config import TELEGRAM_API, telegram_payload
+from app.converter import CONVERTER_MODEL, Converter, GenAiConverter
 from app.interviewer import (
     INTERVIEWER_MODEL,
     PHOTO_PROMPT,
@@ -41,7 +49,7 @@ from app.interviewer import (
     handle_wrong_payload,
 )
 from app.logging_utils import get_logger, logged
-from app.models import OutboundMessage, TelegramUpdate
+from app.models import Dossier, OutboundMessage, OutboundPhoto, TelegramUpdate
 from app.state import SessionPhase, get_store
 
 if TYPE_CHECKING:
@@ -58,7 +66,6 @@ RESET_COMMANDS = frozenset({"/start", "/restart"})
 #: Phases in which a stray non-text payload is worth a gentle nudge, because
 #: the user is meant to be typing an answer or a YES.
 _ANSWER_PHASES = frozenset({SessionPhase.AWAITING_CONFIRMATION, SessionPhase.INTERVIEWING})
-
 
 
 class BouncerFallbackPolicy:
@@ -81,6 +88,8 @@ class MessageSender(Protocol):
 
     def send(self, message: OutboundMessage) -> None: ...
 
+    def send_photo(self, message: OutboundPhoto) -> None: ...
+
 
 def _command_token(text: str) -> str | None:
     """The command word of `text`, with any `@BotName` suffix stripped.
@@ -93,6 +102,21 @@ def _command_token(text: str) -> str | None:
     if not words:
         return None
     return words[0].split("@", 1)[0]
+
+
+def _build_dossier_text(dossier: Dossier) -> str:
+    """Flatten a dossier into the personality summary the Converter reads.
+
+    Question/answer pairs plus the animal rationale — everything the
+    interviewer learned — as one plain-text block. Never includes any
+    secret; only the user's own answers.
+    """
+    parts: list[str] = []
+    for index, item in enumerate(dossier.answers, start=1):
+        parts.append(f"Q{index}: {item.question}\nA{index}: {item.answer}")
+    if dossier.animal_rationale:
+        parts.append(f"Why this animal fits: {dossier.animal_rationale}")
+    return "\n\n".join(parts)
 
 
 def _send_bouncer_fallback(
@@ -117,6 +141,82 @@ def _send(
     return reply
 
 
+def _run_converter(
+    chat_id: int,
+    session,
+    sender: MessageSender | None,
+    converter: Converter,
+) -> OutboundMessage | None:
+    """Run the Converter for a finished interview and deliver the portrait.
+
+    Inputs go in together — the original photo, the dossier summary, and the
+    suggested animal — in a single multimodal request (SPECS/2026-10-17).
+    On success the image is sent directly to Telegram and no text reply is
+    returned. On any failure we log loudly and return a friendly reply; the
+    session stays usable.
+    """
+    dossier = session.dossier
+    if dossier is None or not dossier.suggested_animal:
+        logger.error(
+            "event=converter_skipped chat_id=%s reason=missing_dossier", chat_id
+        )
+        return _send(
+            chat_id,
+            handle_portrait_pending(chat_id).reply.text,
+            sender,
+            event="converter_inputs_missing",
+        )
+    if not session.original_photo_bytes:
+        logger.error(
+            "event=converter_skipped chat_id=%s reason=missing_original_photo",
+            chat_id,
+        )
+        return _send(
+            chat_id,
+            handle_portrait_pending(chat_id).reply.text,
+            sender,
+            event="converter_inputs_missing",
+        )
+
+    try:
+        session.phase = SessionPhase.GENERATING_IMAGE
+        result = converter.generate(
+            original_photo_bytes=session.original_photo_bytes,
+            original_photo_mime=session.original_photo_mime or "image/jpeg",
+            dossier_text=_build_dossier_text(dossier),
+            suggested_animal=dossier.suggested_animal,
+        )
+        if not result.image_bytes:
+            raise RuntimeError("converter returned no image bytes")
+        if sender is not None:
+            sender.send_photo(
+                OutboundPhoto(
+                    chat_id=chat_id,
+                    image_bytes=result.image_bytes,
+                    mime_type=result.image_mime_type or "image/png",
+                    caption=f"Here you are — {dossier.suggested_animal}.",
+                )
+            )
+        session.phase = SessionPhase.DONE
+        logger.info(
+            "event=converter_completed chat_id=%s animal=%s bytes=%d",
+            chat_id,
+            dossier.suggested_animal,
+            len(result.image_bytes),
+        )
+        return None
+    except Exception:
+        # Fail loudly, never crash the poll loop (SPECS/TECH.md error policy).
+        session.phase = SessionPhase.DONE
+        logger.exception("event=converter_error chat_id=%s", chat_id)
+        return _send(
+            chat_id,
+            "The portrait didn't come out this time — try again in a moment?",
+            sender,
+            event="converter_error",
+        )
+
+
 @logged(logger, event="handle_update")
 def handle_update(
     update: TelegramUpdate,
@@ -125,21 +225,22 @@ def handle_update(
     fetcher: PhotoFetcher | None = None,
     classifier: HumanPresenceClassifier | None = None,
     interviewer: Interviewer | None = None,
+    converter: Converter | None = None,
 ) -> OutboundMessage | None:
     """Turn one validated update into at most one outbound reply.
 
-    Routing is phase-aware (SPECS/2026-10-16-interviewer):
+    Routing is phase-aware (SPECS/2026-10-16-interviewer, 2026-10-17-converter):
 
       * **reset commands** (`/start`, `/restart`) purge the chat in *any*
         phase and then point the user at the photo flow.
       * **photo**  -> the Bouncer (Phase 2) gates it. Rejection is sent and
         the chat's ephemeral state is purged; an admission invites an
-        interview. A Bouncer failure sends a friendly fallback without
-        touching state.
+        interview and stores the original photo for the Converter. A Bouncer
+        failure sends a friendly fallback without touching state.
       * **text**   -> no session (or AWAITING_PHOTO) gets the "send a photo"
         prompt and creates NO session; AWAITING_CONFIRMATION starts the
         interview on YES and re-asks otherwise; INTERVIEWING records the
-        answer and asks the next question; later phases point at the portrait.
+        answer and asks the next question; DONE runs the Converter.
       * anything else -> a "answer in words" nudge mid-interview, else logged
         and ignored.
 
@@ -210,6 +311,7 @@ def handle_update(
                 chat_id, sender, reason="interviewer_not_wired"
             )
         admission = handle_photo_admitted(chat_id)
+        _store_original_photo(chat_id, message, fetcher)
         if sender is not None:
             sender.send(admission.reply)
         logger.info("event=replied chat_id=%s via=bouncer_admission", chat_id)
@@ -261,13 +363,43 @@ def handle_update(
         logger.info("event=replied chat_id=%s via=interview_answer", chat_id)
         return decision.reply
 
-    # DONE and any later pipeline phase: the portrait comes next.
+    # DONE (the interview just closed): run the Converter and send the
+    # portrait. Every other later phase has no handler yet, so it just teases.
+    if session.phase == SessionPhase.DONE and converter is not None:
+        return _run_converter(chat_id, session, sender, converter)
+
+    # Any later phase (or a Converter that is not wired): point at the
+    # portrait without pretending it exists.
     decision = handle_portrait_pending(chat_id)
     if sender is not None:
         sender.send(decision.reply)
     logger.info("event=replied chat_id=%s via=portrait_pending", chat_id)
     return decision.reply
 
+
+def _store_original_photo(chat_id: int, message, fetcher: PhotoFetcher | None) -> None:
+    """Fetch and stash the admitted user's largest photo for the Converter.
+
+    The Converter needs the original image as one of its three inputs
+    (SPECS/2026-10-17). A fetch failure is logged and swallowed here: the
+    interview can still proceed, and the Converter degrades gracefully.
+    """
+    photo = message.largest_photo()
+    if photo is None or fetcher is None:
+        return
+    try:
+        data, mime = fetcher.fetch(photo.file_id)
+    except Exception:
+        logger.exception("event=photo_store_failed chat_id=%s", chat_id)
+        return
+    session = get_store().get(chat_id)
+    if session is None:
+        logger.warning("event=photo_store_skipped chat_id=%s reason=no_session", chat_id)
+        return
+    session.original_photo_bytes = data
+    session.original_photo_mime = mime
+    session.original_photo_file_id = photo.file_id
+    logger.info("event=photo_stored chat_id=%s bytes=%d mime=%s", chat_id, len(data), mime)
 
 
 class TelegramSender:
@@ -301,6 +433,36 @@ class TelegramSender:
             )
             raise RuntimeError(f"telegram sendMessage failed: {description!r}")
 
+    def send_photo(self, message: OutboundPhoto) -> None:
+        """Upload image bytes to `sendPhoto` as multipart form data.
+
+        Same secret-safety rule as `send`: no `raise_for_status()`.
+        """
+        files = {
+            "photo": (message.filename, message.image_bytes, message.mime_type)
+        }
+        data: dict[str, str] = {"chat_id": str(message.chat_id)}
+        if message.caption:
+            data["caption"] = message.caption
+        response = self._client.post(
+            f"{TELEGRAM_API}/bot{self._token}/sendPhoto",
+            data=data,
+            files=files,
+            timeout=60.0,
+        )
+        payload = telegram_payload(response)
+        description = payload.get("description") or (
+            f"HTTP {response.status_code} non-json body"
+        )
+        if not response.is_success or not payload.get("ok"):
+            logger.error(
+                "event=send_failed chat_id=%s status=%d description=%r",
+                message.chat_id,
+                response.status_code,
+                description,
+            )
+            raise RuntimeError(f"telegram sendPhoto failed: {description!r}")
+
 
 def _raw_update_id(raw: object) -> int | None:
     """`update_id` from an untrusted batch entry, or None if it isn't an int.
@@ -326,6 +488,7 @@ def poll_once(
     fetcher: PhotoFetcher | None = None,
     classifier: HumanPresenceClassifier | None = None,
     interviewer: Interviewer | None = None,
+    converter: Converter | None = None,
 ) -> int:
     """Fetch one batch of updates, reply to each, return the next offset.
 
@@ -385,6 +548,7 @@ def poll_once(
                 fetcher=fetcher,
                 classifier=classifier,
                 interviewer=interviewer,
+                converter=converter,
             )
         except Exception:
             # Isolated: log loudly, keep answering the rest of the batch.
@@ -418,15 +582,25 @@ def run(token: str) -> None:
             logger.exception("event=interviewer_init_failed")
             interviewer = None  # text mid-interview degrades gracefully
 
+        # The Converter is wired the same way, independently again: a failure
+        # to construct it must not stop the rest of the pipeline.
+        try:
+            converter: Converter | None = GenAiConverter()
+        except Exception:
+            logger.exception("event=converter_init_failed")
+            converter = None  # DONE falls back to the portrait tease
+
         logger.info(
             "event=gateway_started transport=long_polling tracked_chats=%d "
             "bouncer_model=%s bouncer_wired=%s interviewer_model=%s "
-            "interviewer_wired=%s",
+            "interviewer_wired=%s converter_model=%s converter_wired=%s",
             len(store.chat_ids),
             BOUNCER_MODEL,
             classifier is not None,
             INTERVIEWER_MODEL,
             interviewer is not None,
+            CONVERTER_MODEL,
+            converter is not None,
         )
 
         offset = 0
@@ -440,6 +614,7 @@ def run(token: str) -> None:
                     fetcher=fetcher,
                     classifier=classifier,
                     interviewer=interviewer,
+                    converter=converter,
                 )
             except httpx.HTTPError:
                 # Log loudly, keep polling (SPECS/TECH.md error policy).

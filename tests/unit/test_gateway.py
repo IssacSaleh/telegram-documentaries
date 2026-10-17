@@ -27,14 +27,17 @@ from app.interviewer import (
     PORTRAIT_PENDING_REPLY,
     WRONG_PAYLOAD_PROMPT,
 )
-from app.models import OutboundMessage, TelegramUpdate
+from app.models import OutboundMessage, OutboundPhoto, TelegramUpdate
 from app.state import SessionPhase, get_store
 from tests.conftest import (
     ExplodingClassifier,
+    ExplodingConverter,
     ExplodingPhotoFetcher,
     FakeClassifier,
+    FakeConverter,
     FakeInterviewer,
     FakePhotoFetcher,
+    FlakyPhotoFetcher,
     RecordingSender,
     human_verdict,
     no_human_verdict,
@@ -638,6 +641,208 @@ class TestInterviewRouting:
 
         assert reply is not None, "never leave a user mid-interview in silence"
         assert reply.text == BouncerFallbackPolicy.ERROR_REPLY
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: the Converter (DONE -> portrait sent straight to Telegram)
+# ---------------------------------------------------------------------------
+
+
+class TestConverterRouting:
+    """DONE with a wired Converter fuses photo + dossier + animal and sends it.
+
+    SPECS/2026-10-17-converter: auto-trigger when the interview finishes,
+    one multimodal request with all three inputs, the image returned directly
+    to Telegram, no intermediate text hop, and graceful failure.
+    """
+
+    def _finish_interview(
+        self, sender: RecordingSender, chat_id: int, animal: str = "Red Fox"
+    ) -> FakeInterviewer:
+        """Drive a chat through admission to DONE, storing a photo along the way."""
+        interviewer = FakeInterviewer([], animal=animal)
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(5):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+            )
+        assert get_store().get(chat_id).phase is SessionPhase.DONE
+        return interviewer
+
+    def test_done_phase_sends_the_portrait_and_returns_no_text(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        chat_id = 700
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        sender.photos.clear()
+
+        reply = handle_update(
+            _update("what now?", chat_id=chat_id), sender, converter=converter
+        )
+
+        assert reply is None, "the portrait is the reply, not a text message"
+        assert len(sender.photos) == 1
+        assert sender.photos[0].image_bytes == b"PORTRAIT"
+        assert sender.photos[0].chat_id == chat_id
+        assert store.get(chat_id).phase is SessionPhase.DONE
+
+    def test_converter_receives_all_three_inputs_together(self) -> None:
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 701
+        self._finish_interview(sender, chat_id, animal="Arctic Fox")
+
+        handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert len(converter.calls) == 1
+        call = converter.calls[0]
+        # (1) the original photo, fetched at admission
+        assert call["original_photo_bytes"] == b"\xff\xd8ORIGINAL"
+        assert call["original_photo_mime"] == "image/jpeg"
+        # (2) the dossier summary, derived from the interview answers
+        assert "an answer" in call["dossier_text"]
+        # (3) the suggested animal from the Interviewer
+        assert call["suggested_animal"] == "Arctic Fox"
+
+    def test_portrait_caption_names_the_suggested_animal(self) -> None:
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 702
+        self._finish_interview(sender, chat_id, animal="Snowy Owl")
+        sender.photos.clear()
+
+        handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert sender.photos[0].caption is not None
+        assert "Snowy Owl" in sender.photos[0].caption
+
+    def test_converter_failure_degrades_without_killing_the_session(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = ExplodingConverter()
+        chat_id = 703
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        sender.sent.clear()
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert reply is not None, "never leave the user in silence on a failure"
+        assert sender.photos == []
+        assert store.get(chat_id).phase is SessionPhase.DONE
+
+    def test_missing_original_photo_teases_instead_of_calling_the_converter(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 704
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        # Simulate a photo that could not be fetched at admission time.
+        store.get(chat_id).original_photo_bytes = None
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert converter.calls == []
+        assert reply is not None
+        assert reply.text == PORTRAIT_PENDING_REPLY
+
+    def test_done_without_a_converter_still_teases(self) -> None:
+        sender = RecordingSender()
+        chat_id = 705
+        self._finish_interview(sender, chat_id)
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=None)
+
+        assert reply is not None
+        assert reply.text == PORTRAIT_PENDING_REPLY
+
+    def test_admission_stores_the_original_photo(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        fetcher = FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg")
+        chat_id = 706
+
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=fetcher,
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
+        )
+
+        session = store.get(chat_id)
+        assert session.original_photo_bytes == b"\xff\xd8ORIGINAL"
+        assert session.original_photo_mime == "image/jpeg"
+        assert session.original_photo_file_id == "largest"
+
+    def test_admission_survives_a_photo_fetch_failure(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        chat_id = 707
+
+        reply = handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FlakyPhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
+        )
+
+        assert reply is not None, "a fetch failure must not stall the interview"
+        assert store.get(chat_id).original_photo_bytes is None
+        assert store.get(chat_id).phase is SessionPhase.AWAITING_CONFIRMATION
+
+
+class TestTelegramSenderSendPhoto:
+    def test_ok_true_returns_without_raising(self) -> None:
+        client = _client_returning(
+            {"ok": True, "result": {"message_id": 1, "chat": {"id": 555}, "date": 1}}
+        )
+        sender = TelegramSender(token="123:TOKEN", client=client)
+
+        sender.send_photo(
+            OutboundPhoto(chat_id=555, image_bytes=b"\x89PNG", mime_type="image/png")
+        )  # must not raise
+
+    def test_ok_false_raises_with_telegrams_description(self) -> None:
+        client = _client_returning(
+            {"ok": False, "description": "Bad Request: chat not found"}
+        )
+        sender = TelegramSender(token="123:TOKEN", client=client)
+
+        with pytest.raises(RuntimeError, match="sendPhoto failed") as exc_info:
+            sender.send_photo(OutboundPhoto(chat_id=555, image_bytes=b"x"))
+
+        assert "chat not found" in str(exc_info.value)
+
+    def test_sends_image_bytes_as_multipart(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["content_type"] = request.headers.get("content-type", "")
+            captured["body"] = request.read()
+            return httpx.Response(
+                200, json={"ok": True, "result": {"message_id": 1}}, request=request
+            )
+
+        sender = TelegramSender(
+            token="123:TOKEN", client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        sender.send_photo(
+            OutboundPhoto(chat_id=555, image_bytes=b"IMAGEDATA", caption="hi")
+        )
+
+        assert "multipart/form-data" in captured["content_type"]
+        assert b"IMAGEDATA" in captured["body"]
 
 
 # ---------------------------------------------------------------------------

@@ -131,6 +131,18 @@ class Dossier(BaseModel):
         return len(self.answers)
 
 
+class OutboundPhoto(BaseModel):
+    """A photo the gateway will send. Never a raw dict (TECH boundary rule)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat_id: int
+    image_bytes: bytes
+    caption: str | None = None
+    filename: str = "portrait.png"
+    mime_type: str = "image/png"
+
+
 class InterviewTurn(BaseModel):
     """Structured output from the Interviewer per turn."""
 

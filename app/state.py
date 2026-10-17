@@ -58,6 +58,9 @@ class Session:
     )
     dossier: Dossier | None = None
     pending_question: str | None = None
+    original_photo_bytes: bytes | None = None
+    original_photo_mime: str | None = None
+    original_photo_file_id: str | None = None
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)

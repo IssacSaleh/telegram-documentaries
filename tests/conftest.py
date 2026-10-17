@@ -7,7 +7,7 @@ from collections.abc import Iterable
 
 import pytest
 
-from app.models import BouncerVerdict, InterviewTurn, OutboundMessage
+from app.models import BouncerVerdict, InterviewTurn, OutboundMessage, OutboundPhoto
 
 # A realistic Telegram `getUpdates` payload. Deliberately stuffed with extra
 # fields Telegram actually sends but our models do not care about, to prove
@@ -96,7 +96,7 @@ def bot_token() -> str:
 
 
 class RecordingSender:
-    """`MessageSender` double: records every outbound message.
+    """`MessageSender` double: records every outbound message and photo.
 
     Chats listed in `fail_on` raise BEFORE a successful send is recorded, so
     a test can model one chat's send failing (e.g. a 403-blocked chat) while
@@ -106,6 +106,8 @@ class RecordingSender:
     def __init__(self, fail_on: Iterable[int] = ()) -> None:
         self.attempts: list[OutboundMessage] = []
         self.sent: list[OutboundMessage] = []
+        self.photo_attempts: list[OutboundPhoto] = []
+        self.photos: list[OutboundPhoto] = []
         self._fail_on = set(fail_on)
 
     def send(self, message: OutboundMessage) -> None:
@@ -113,6 +115,12 @@ class RecordingSender:
         if message.chat_id in self._fail_on:
             raise RuntimeError(f"send failed for chat {message.chat_id}")
         self.sent.append(message)
+
+    def send_photo(self, message: OutboundPhoto) -> None:
+        self.photo_attempts.append(message)
+        if message.chat_id in self._fail_on:
+            raise RuntimeError(f"send_photo failed for chat {message.chat_id}")
+        self.photos.append(message)
 
 
 class FakePhotoFetcher:
@@ -133,6 +141,26 @@ class ExplodingPhotoFetcher:
 
     def fetch(self, file_id: str) -> tuple[bytes, str]:
         raise RuntimeError("telegram getFile exploded")
+
+
+class FlakyPhotoFetcher:
+    """PhotoFetcher double: succeeds for the Bouncer, fails on the later store.
+
+    The gateway fetches an admitted photo twice — once for classification in
+    `bounce()`, once to stash it for the Converter. This models the second
+    fetch failing (a transient Telegram hiccup) without breaking admission.
+    """
+
+    def __init__(self, data: bytes = b"\xff\xd8fakejpeg", mime: str = "image/jpeg") -> None:
+        self.data = data
+        self.mime = mime
+        self.calls = 0
+
+    def fetch(self, file_id: str) -> tuple[bytes, str]:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("telegram getFile exploded on the second call")
+        return self.data, self.mime
 
 
 class FakeClassifier:
@@ -214,3 +242,56 @@ class ExplodingInterviewer:
 
     def final_turn(self, dossier) -> InterviewTurn:
         raise RuntimeError("gemini 500")
+
+
+class FakeConverter:
+    """`Converter` double: records inputs, returns canned image bytes.
+
+    Proves the gateway passes *all three* Converter inputs together — the
+    original photo bytes/mime, the dossier text, and the suggested animal —
+    without any network call.
+    """
+
+    def __init__(
+        self,
+        image_bytes: bytes = b"\x89PNGfakeportrait",
+        mime_type: str = "image/png",
+    ) -> None:
+        self.image_bytes = image_bytes
+        self.mime_type = mime_type
+        self.calls: list[dict] = []
+
+    def generate(
+        self,
+        *,
+        original_photo_bytes: bytes,
+        original_photo_mime: str,
+        dossier_text: str,
+        suggested_animal: str,
+    ):
+        from app.converter import ConverterResult
+
+        self.calls.append(
+            {
+                "original_photo_bytes": original_photo_bytes,
+                "original_photo_mime": original_photo_mime,
+                "dossier_text": dossier_text,
+                "suggested_animal": suggested_animal,
+            }
+        )
+        return ConverterResult(
+            suggested_animal=suggested_animal,
+            image_bytes=self.image_bytes,
+            image_mime_type=self.mime_type,
+        )
+
+
+class ExplodingConverter:
+    """`Converter` double that models a Gemini image-model failure."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        raise RuntimeError("gemini image 500")
