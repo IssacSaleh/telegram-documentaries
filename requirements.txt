@@ -1,0 +1,8 @@
+# Runtime dependencies for The Telegram Documentaries gateway.
+# Install with:  pip install -r requirements.txt
+pydantic>=2.7,<3
+python-dotenv>=1.0,<2
+httpx>=0.27,<1
+# Google ADK: the Bouncer's vision agent (Gemini 3.1 Flash Lite) and its
+# structured-output wiring. Pulls google-genai in transit.
+google-adk>=2.11,<3

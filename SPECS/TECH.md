@@ -16,6 +16,12 @@
 > **Note:** these model IDs are dated versions. If Google retires one, this file
 > is the single place that must be updated — every other document defers here.
 
+> **Open item:** the Converter's exact image generation model ID is not yet
+> pinned here; it must be supplied by the user before that phase is built.
+
+Runtime dependencies are pinned in `requirements.txt`; the Bouncer adds
+`google-adk` (which pulls `google-genai` in transit).
+
 ## Architecture
 
 ADK **hub-and-spoke**:
@@ -31,6 +37,16 @@ ADK **hub-and-spoke**:
   inference over the raw message history.
 
 Pipeline: `Bouncer → Interviewer → Converter → Scripter → Narrator`.
+
+### Bouncer (delivered)
+
+The vision gate is the first ADK agent. It is a single
+`LlmAgent(name="bouncer", model="gemini-3.1-flash-lite",
+output_schema=BouncerVerdict)`; the structured response is validated into
+`BouncerVerdict` before it crosses the boundary. Each photo runs in its own
+`InMemoryRunner` session, so verdicts never share state across chats.
+Classification is synchronous (`asyncio.run`) because the gateway is a
+synchronous long-poll loop.
 
 ## Contracts at boundaries
 
@@ -51,6 +67,15 @@ Pipeline: `Bouncer → Interviewer → Converter → Scripter → Narrator`.
   still fails, send a friendly message and keep the session alive. **Never raise
   into the user's flow.**
 - Prohibited: bare `except: pass`, swallowed exceptions, un-logged fallbacks.
+
+## Secret-safe transport
+
+Every Telegram request URL carries the bot token
+(`https://api.telegram.org/bot<token>/...`), so transport code must never call
+`raise_for_status()`: `httpx` embeds the full URL in the exception message,
+which leaks the secret into the logs (MISSION non-negotiable). Parse bodies with
+the `telegram_payload()` helper — it returns `{}` for proxy HTML error pages —
+and report HTTP status plus Telegram's `description` instead.
 
 ## Session state
 
@@ -87,6 +112,9 @@ Any message arriving in the wrong phase is handled by the wrong-payload guard
   - `scripts/test`
   - `scripts/hooks`
 - These scripts are documented here **and** in the README, and kept in sync.
+- The default run is offline and deterministic. Tests that call the real Gemini
+  Bouncer are skipped unless `RUN_LIVE_TESTS=1` is set (e.g.
+  `RUN_LIVE_TESTS=1 ./scripts/test`).
 
 ## Repo hygiene
 
