@@ -101,12 +101,15 @@ records what was actually verified vs. not verifiable in this environment.
 
 ## End-to-end on the live bot (manual, reported honestly)
 
-- [ ] **pending human E2E — offline/live-test verified only.** Server
-      restart + `gateway_started` line with
-      `narrator_model=gemini-3.1-flash-tts-preview narrator_wired=True` is
-      covered by the offline test
-      `test_gateway_started_reports_the_narrator_model_and_wiring`, but no
-      live server run was performed in this verification session.
+- [x] **Verified by the orchestrator after the verifier pass (11:00, PID
+      38860):** server restarted cleanly on the feature branch; the live
+      `gateway_started` log line reads
+      `… converter_model=gemini-3.1-flash-image converter_wired=True
+      scripter_wired=True narrator_model=gemini-3.1-flash-tts-preview
+      narrator_wired=True`; long-poll socket ESTAB to Telegram's DC,
+      `getMe` ok, and a delivery to the active chat succeeded
+      (`sendMessage` → `message_id 259`). Also covered offline by
+      `test_gateway_started_reports_the_narrator_model_and_wiring`.
 - [ ] **pending human E2E — offline/live-test verified only.** Full happy
       path (portrait → interview → hybrid portrait → script text →
       playable voice note in the Telegram client) requires a human to send
@@ -122,9 +125,11 @@ records what was actually verified vs. not verifiable in this environment.
       suite (`278 passed, 8 skipped`), `./scripts/hooks` clean, real Gemini
       TTS synthesis via the gated live test, transport and phase-machine
       behaviour via mocks, secret hygiene. NOT verified here — anything
-      requiring the running bot in Telegram (server restart line, Telegram
-      rendering/playability of the voice note): left as pending human E2E
-      above. No unverified claims.
+      requiring a human in the Telegram client (full portrait → voice-note
+      happy path, rendering/playability of the voice note): left as pending
+      human E2E above. The server restart line was verified separately by
+      the orchestrator after this verification pass (box updated with
+      evidence). No unverified claims.
 
 ## Spec-drift review (verifier)
 
