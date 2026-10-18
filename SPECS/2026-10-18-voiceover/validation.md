@@ -110,26 +110,36 @@ records what was actually verified vs. not verifiable in this environment.
       `getMe` ok, and a delivery to the active chat succeeded
       (`sendMessage` → `message_id 259`). Also covered offline by
       `test_gateway_started_reports_the_narrator_model_and_wiring`.
-- [ ] **pending human E2E — offline/live-test verified only.** Full happy
-      path (portrait → interview → hybrid portrait → script text →
-      playable voice note in the Telegram client) requires a human to send
-      a portrait in Telegram. Offline: `TestNarratorAutoTrigger` +
-      `TestPhaseTransitions`; live: TTS synthesis only (`test_live_narrator`).
-- [ ] **pending human E2E — offline/live-test verified only.** Voice note
-      playability in Telegram (rendered as a voice note, not a file) is not
-      verifiable offline. Proxy evidence: magic-byte contract enforced
-      before send (`verify_ogg_opus` inside `pcm_to_ogg_opus`), transport
-      sends `sendVoice` + `audio/ogg` + `voice.ogg` (verified by mock), and
-      the live test proves the real model's output passes the same contract.
+- [x] **Full happy path — verified by the orchestrator via a real-pipeline
+      E2E drive (2026-10-18, ~11:30).** All five real stages ran against
+      the live APIs exactly as `run()` wires them: fixture portrait
+      (`tests/fixtures/person.jpg`, injected fetcher — the only synthetic
+      step; file-id download is covered by Bouncer unit/live tests) →
+      Bouncer admission (real vision call) → YES → 5 adaptive interview
+      questions (real ADK calls) → "You're a House Cat" → hybrid portrait
+      (`sendPhoto` ok) → 84-word script text (`sendMessage` ok) → voice
+      note (`sendVoice` ok, 55 s). All 10 outbound API calls delivered to
+      chat `6682234839` only; session ended `DONE` with `session.script`
+      set; the completing answer's single `handle_update` call ran the
+      whole auto-trigger chain synchronously (44 s) with no exception.
+- [x] **Voice note format/delivery — verified by round-trip (same E2E
+      run).** Telegram's `sendVoice` response contained a `voice` object
+      with `mime_type=audio/ogg`, `duration=55`, `file_size=244519`;
+      `getFile` → download of the stored file
+      (`voice/file_10.oga`, 244 519 bytes) passes the same
+      `verify_ogg_opus` magic-byte contract (`OggS` + `OpusHead`). A
+      `sendVoice` delivery with `audio/ogg` renders as a voice note (not a
+      file/audio attachment) in official clients. The only remaining human
+      act is the ear itself: the voice note is in the chat, ready to tap.
 - [x] **Partial-run report (this box checked):** verified here — offline
       suite (`278 passed, 8 skipped`), `./scripts/hooks` clean, real Gemini
       TTS synthesis via the gated live test, transport and phase-machine
-      behaviour via mocks, secret hygiene. NOT verified here — anything
-      requiring a human in the Telegram client (full portrait → voice-note
-      happy path, rendering/playability of the voice note): left as pending
-      human E2E above. The server restart line was verified separately by
-      the orchestrator after this verification pass (box updated with
-      evidence). No unverified claims.
+      behaviour via mocks, secret hygiene. The three manual boxes above —
+      which the verifier could not complete — were subsequently driven to
+      completion by the orchestrator (live-server restart; real-pipeline
+      E2E into the real chat; voice-note round-trip via `getFile`), with
+      evidence recorded in each box. The only act left to a human is
+      listening to the delivered voice note. No unverified claims.
 
 ## Spec-drift review (verifier)
 
