@@ -726,6 +726,136 @@ class TestConverterRouting:
         assert sender.photos[0].caption is not None
         assert "Snowy Owl" in sender.photos[0].caption
 
+    def test_final_answer_auto_triggers_the_portrait(self) -> None:
+        """The image must arrive with the last answer — no extra message."""
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 710
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+        sender.photos.clear()
+
+        # Fifth answer completes the interview: portrait fires in THIS update.
+        handle_update(
+            _update("an answer", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+            converter=converter,
+        )
+
+        assert store.get(chat_id).phase is SessionPhase.DONE
+        assert len(sender.photos) == 1, "portrait must be sent with the last answer"
+        assert sender.photos[0].image_bytes == b"PORTRAIT"
+
+    def test_final_answer_auto_triggers_the_narration_script(self) -> None:
+        """The Scripter's narration follows the portrait automatically."""
+        from tests.conftest import FakeScripter
+
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        scripter = FakeScripter(script="In the quiet hours, a fox-like soul stirs.")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 711
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+        sender.sent.clear()
+        sender.photos.clear()
+
+        handle_update(
+            _update("an answer", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+            converter=converter,
+            scripter=scripter,
+        )
+
+        assert len(scripter.calls) == 1, "script must be generated from the dossier"
+        assert len(sender.photos) == 1
+        assert sender.sent[-1].text == "In the quiet hours, a fox-like soul stirs."
+        # Portrait (photo) is delivered before the narration (text).
+        assert sender.photos and sender.sent
+
+        # The raw script is cleanly captured on the session, ready for
+        # audio synthesis (Phase 6 Narrator).
+        session = get_store().get(chat_id)
+        assert session.script == "In the quiet hours, a fox-like soul stirs."
+        assert session.script.strip() == session.script, "no stray whitespace"
+        assert "\n" not in session.script, "single paragraph only"
+        assert len(session.script.split()) <= 90, "≤90 words for TTS"
+
+    def test_script_capture_is_visible_in_the_console_log(self, caplog) -> None:
+        """The ops-visible line: chars, words, and that state stored it."""
+        from tests.conftest import FakeScripter
+
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        scripter = FakeScripter(script="A quiet narration of the wild couch.")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 713
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries"):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+                scripter=scripter,
+            )
+
+        captured_lines = [
+            r.message
+            for r in caplog.records
+            if "event=script_captured" in r.message
+        ]
+        assert captured_lines, "script_captured must appear in the console log"
+        line = captured_lines[0]
+        assert f"chat_id={chat_id}" in line
+        assert "words=" in line
+        assert "session_script_stored=True" in line
+
     def test_converter_failure_degrades_without_killing_the_session(self) -> None:
         store = get_store()
         sender = RecordingSender()

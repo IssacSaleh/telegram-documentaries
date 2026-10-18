@@ -20,7 +20,9 @@
 > pinned here; it must be supplied by the user before that phase is built.
 
 Runtime dependencies are pinned in `requirements.txt`; the Bouncer adds
-`google-adk` (which pulls `google-genai` in transit).
+`google-adk` (which pulls `google-genai` in transit), and the Narrator adds
+`soundfile` (bundles libsndfile — no system encoder exists in this
+environment) for PCM → OGG/Opus conversion.
 
 ## Architecture
 
@@ -47,6 +49,23 @@ output_schema=BouncerVerdict)`; the structured response is validated into
 `InMemoryRunner` session, so verdicts never share state across chats.
 Classification is synchronous (`asyncio.run`) because the gateway is a
 synchronous long-poll loop.
+
+### Narrator (delivered)
+
+**Not an agent.** The finished script is routed straight to Gemini TTS
+(pinned `gemini-3.1-flash-tts-preview`) through the plain `google-genai`
+client — direct `models.generate_content`, no `LlmAgent`, no runner, like
+`GenAiConverter`. Voice: the prebuilt deep-male `Charon` preset plus a
+style instruction wrapping the script (dramatic, posh British wildlife-
+documentary narrator). The model returns raw PCM (`audio/l16;
+rate=24000; channels=1`), so `app/narrator.py` converts it to OGG/Opus
+in memory via `soundfile`/libsndfile (no system encoder in this
+environment, no temp files) and **magic-byte-verifies its own output**
+(`OggS` at offset 0, `OpusHead` inside the first page) before anything
+reaches Telegram. The gateway sends it with `sendVoice` (multipart,
+`voice.ogg`, `audio/ogg`) so Telegram renders it as a playable voice
+note — never `sendAudio`/MP3. Every failure (TTS, conversion, send)
+degrades to a friendly reply and lands the session in `DONE`.
 
 ## Contracts at boundaries
 

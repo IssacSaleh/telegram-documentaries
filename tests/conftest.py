@@ -8,6 +8,7 @@ from collections.abc import Iterable
 import pytest
 
 from app.models import BouncerVerdict, InterviewTurn, OutboundMessage, OutboundPhoto
+from app.narrator import OutboundVoice
 
 # A realistic Telegram `getUpdates` payload. Deliberately stuffed with extra
 # fields Telegram actually sends but our models do not care about, to prove
@@ -96,7 +97,11 @@ def bot_token() -> str:
 
 
 class RecordingSender:
-    """`MessageSender` double: records every outbound message and photo.
+    """`MessageSender` double: records every outbound message, photo, voice.
+
+    ``events`` appends the kind of each attempt (``"send"``/``"photo"``/
+    ``"voice"``) in call order, so a test can assert the delivery ORDER of
+    portrait -> script text -> voice note across the separate lists.
 
     Chats listed in `fail_on` raise BEFORE a successful send is recorded, so
     a test can model one chat's send failing (e.g. a 403-blocked chat) while
@@ -108,19 +113,31 @@ class RecordingSender:
         self.sent: list[OutboundMessage] = []
         self.photo_attempts: list[OutboundPhoto] = []
         self.photos: list[OutboundPhoto] = []
+        self.voice_attempts: list[OutboundVoice] = []
+        self.voices: list[OutboundVoice] = []
+        self.events: list[str] = []
         self._fail_on = set(fail_on)
 
     def send(self, message: OutboundMessage) -> None:
+        self.events.append("send")
         self.attempts.append(message)
         if message.chat_id in self._fail_on:
             raise RuntimeError(f"send failed for chat {message.chat_id}")
         self.sent.append(message)
 
     def send_photo(self, message: OutboundPhoto) -> None:
+        self.events.append("photo")
         self.photo_attempts.append(message)
         if message.chat_id in self._fail_on:
             raise RuntimeError(f"send_photo failed for chat {message.chat_id}")
         self.photos.append(message)
+
+    def send_voice(self, message: OutboundVoice) -> None:
+        self.events.append("voice")
+        self.voice_attempts.append(message)
+        if message.chat_id in self._fail_on:
+            raise RuntimeError(f"send_voice failed for chat {message.chat_id}")
+        self.voices.append(message)
 
 
 class FakePhotoFetcher:
@@ -295,3 +312,40 @@ class ExplodingConverter:
     def generate(self, **kwargs):
         self.calls.append(kwargs)
         raise RuntimeError("gemini image 500")
+
+
+class FakeScripter:
+    """Scripter double: returns canned script."""
+
+    def __init__(self, script: str = "A most dramatic tale of a cunning creature.") -> None:
+        self.script = script
+        self.calls: list = []
+
+    def generate_script(self, dossier) -> str:
+        self.calls.append(dossier)
+        return self.script
+
+
+class FakeNarrator:
+    """Narrator double: records the scripts it is asked to render.
+
+    Returns canned bytes — the gateway's contract with the Narrator is to
+    transport whatever *verified* bytes the Narrator returns (SPECS/
+    2026-10-18-voiceover D5); format verification is the Narrator's own
+    boundary and is tested there.
+    """
+
+    def __init__(self, audio_bytes: bytes = b"OggSfakevoicenote") -> None:
+        self.audio_bytes = audio_bytes
+        self.calls: list[str] = []
+
+    def synthesise(self, script: str) -> bytes:
+        self.calls.append(script)
+        return self.audio_bytes
+
+
+class ExplodingNarrator:
+    """Narrator double that models a Gemini TTS failure."""
+
+    def synthesise(self, script: str) -> bytes:
+        raise RuntimeError("gemini tts 500")

@@ -10,6 +10,12 @@ Phase 4 adds **the Converter**: once the interview closes, the original
 photo, the dossier/personality summary, and the suggested animal go to
 Gemini 3.1 Flash Image in one multimodal request, and the hybrid portrait
 comes straight back to Telegram.
+Phase 5 adds **the Scripter**: the finished interview is narrated as a
+one-paragraph British-documentary script, stored on the session and sent
+to the chat as plain text.
+Phase 6 adds **the Narrator** (not an ADK agent): the script goes straight
+to Gemini TTS, is encoded as OGG/Opus, and follows the script text as a
+Telegram voice note.
 
 Routing is driven by the chat's phase (SPECS/2026-10-16-interviewer and
 SPECS/2026-10-17-converter):
@@ -23,9 +29,9 @@ SPECS/2026-10-17-converter):
   * **other**  -> mid-interview, a gentle "answer in words"; otherwise logged
     and ignored.
 
-Any failure (fetch, classification, conversion, ADK not wired) degrades to a
-friendly reply — the user is never left in silence (SPECS/TECH.md error
-policy).
+Any failure (fetch, classification, conversion, script, TTS, ADK not wired)
+degrades to a friendly reply — the user is never left in silence
+(SPECS/TECH.md error policy).
 """
 
 from __future__ import annotations
@@ -50,6 +56,8 @@ from app.interviewer import (
 )
 from app.logging_utils import get_logger, logged
 from app.models import Dossier, OutboundMessage, OutboundPhoto, TelegramUpdate
+from app.narrator import NARRATOR_MODEL, GeminiTtsNarrator, Narrator, OutboundVoice
+from app.scripter import AdkScripter, Scripter
 from app.state import SessionPhase, get_store
 
 if TYPE_CHECKING:
@@ -83,12 +91,29 @@ class BouncerFallbackPolicy:
     )
 
 
+class NarratorFallbackPolicy:
+    """Friendly reply when the voice note cannot be delivered.
+
+    The Scripter's text narration has already reached the chat, so a TTS
+    failure (or a failed sendVoice) degrades to this reply instead of
+    silence — the conversation continues and the session lands in DONE
+    (SPECS/TECH.md error policy; decision D6).
+    """
+
+    ERROR_REPLY = (
+        "The voice note didn't make it out this time — the narration above "
+        "is still yours to enjoy. Better luck next run!"
+    )
+
+
 class MessageSender(Protocol):
     """What the handler needs from a transport — kept narrow for testing."""
 
     def send(self, message: OutboundMessage) -> None: ...
 
     def send_photo(self, message: OutboundPhoto) -> None: ...
+
+    def send_voice(self, message: OutboundVoice) -> None: ...
 
 
 def _command_token(text: str) -> str | None:
@@ -146,14 +171,23 @@ def _run_converter(
     session,
     sender: MessageSender | None,
     converter: Converter,
+    scripter: Scripter | None = None,
+    narrator: Narrator | None = None,
 ) -> OutboundMessage | None:
-    """Run the Converter for a finished interview and deliver the portrait.
+    """Run the Converter for a finished interview and deliver the full chain.
 
     Inputs go in together — the original photo, the dossier summary, and the
     suggested animal — in a single multimodal request (SPECS/2026-10-17).
-    On success the image is sent directly to Telegram and no text reply is
-    returned. On any failure we log loudly and return a friendly reply; the
-    session stays usable.
+    On success the portrait goes straight to Telegram, the Scripter's
+    narration follows it as plain text (decision D2: the text message stays),
+    and the Narrator's verified OGG/Opus voice note follows that — portrait
+    -> script text -> voice note, one stage per try/except, no extra user
+    message anywhere.
+
+    Phase transitions per SPECS/TECH.md (decision D6): GENERATING_IMAGE when
+    the fusion starts, SCRIPTING once the portrait is out, NARRATING once
+    the script is back, DONE once the voice note is delivered (or on any
+    failure branch) — the session is never left stuck mid-chain.
     """
     dossier = session.dossier
     if dossier is None or not dossier.suggested_animal:
@@ -197,14 +231,47 @@ def _run_converter(
                     caption=f"Here you are — {dossier.suggested_animal}.",
                 )
             )
-        session.phase = SessionPhase.DONE
         logger.info(
             "event=converter_completed chat_id=%s animal=%s bytes=%d",
             chat_id,
             dossier.suggested_animal,
             len(result.image_bytes),
         )
-        return None
+        # Portrait delivered: the Scripter is next (TECH.md state table).
+        session.phase = SessionPhase.SCRIPTING
+        if scripter is None:
+            # Not wired: no narration to write, so nothing to narrate —
+            # the chain ends cleanly at DONE instead of idling in SCRIPTING.
+            session.phase = SessionPhase.DONE
+            return None
+        try:
+            script = scripter.generate_script(dossier)
+            if script:
+                # Capture the raw narration on the session so it is
+                # available to the Narrator (Phase 6) for audio synthesis.
+                session.script = script
+                session.touch()
+                logger.info(
+                    "event=script_captured chat_id=%s chars=%d words=%d "
+                    "session_script_stored=%s",
+                    chat_id,
+                    len(script),
+                    len(script.split()),
+                    session.script is not None,
+                )
+                if sender is not None:
+                    sender.send(OutboundMessage(chat_id=chat_id, text=script))
+                logger.info("event=script_sent chat_id=%s", chat_id)
+            else:
+                session.phase = SessionPhase.DONE
+                return None
+        except Exception:
+            session.phase = SessionPhase.DONE
+            logger.exception("event=scripter_error chat_id=%s", chat_id)
+            return None
+        # Script delivered as text: the Narrator is next.
+        session.phase = SessionPhase.NARRATING
+        return _deliver_voice_note(chat_id, session, sender, narrator, script)
     except Exception:
         # Fail loudly, never crash the poll loop (SPECS/TECH.md error policy).
         session.phase = SessionPhase.DONE
@@ -217,6 +284,54 @@ def _run_converter(
         )
 
 
+def _deliver_voice_note(
+    chat_id: int,
+    session,
+    sender: MessageSender | None,
+    narrator: Narrator | None,
+    script: str,
+) -> OutboundMessage | None:
+    """Synthesise ``script`` and deliver it as a Telegram voice note.
+
+    Every branch lands the session in DONE (decision D6): success, narrator
+    not wired (logged only — the script text above is already the
+    deliverable), TTS failure, and sendVoice failure (those two degrade
+    with a friendly reply). Nothing here may raise into the caller: the
+    script text has already been sent, so silence would break the
+    conversation (SPECS/TECH.md error policy).
+    """
+    if narrator is None:
+        logger.warning("event=narrator_not_wired chat_id=%s", chat_id)
+        session.phase = SessionPhase.DONE
+        return None
+    try:
+        audio = narrator.synthesise(script)
+    except Exception:
+        session.phase = SessionPhase.DONE
+        logger.exception("event=narrator_error chat_id=%s", chat_id)
+        return _send(
+            chat_id,
+            NarratorFallbackPolicy.ERROR_REPLY,
+            sender,
+            event="narrator_error",
+        )
+    try:
+        if sender is not None:
+            sender.send_voice(OutboundVoice(chat_id=chat_id, audio_bytes=audio))
+    except Exception:
+        session.phase = SessionPhase.DONE
+        logger.exception("event=voice_send_failed chat_id=%s", chat_id)
+        return _send(
+            chat_id,
+            NarratorFallbackPolicy.ERROR_REPLY,
+            sender,
+            event="voice_send_failed",
+        )
+    session.phase = SessionPhase.DONE
+    logger.info("event=voice_sent chat_id=%s bytes=%d", chat_id, len(audio))
+    return None
+
+
 @logged(logger, event="handle_update")
 def handle_update(
     update: TelegramUpdate,
@@ -226,6 +341,8 @@ def handle_update(
     classifier: HumanPresenceClassifier | None = None,
     interviewer: Interviewer | None = None,
     converter: Converter | None = None,
+    scripter: Scripter | None = None,
+    narrator: Narrator | None = None,
 ) -> OutboundMessage | None:
     """Turn one validated update into at most one outbound reply.
 
@@ -240,7 +357,8 @@ def handle_update(
       * **text**   -> no session (or AWAITING_PHOTO) gets the "send a photo"
         prompt and creates NO session; AWAITING_CONFIRMATION starts the
         interview on YES and re-asks otherwise; INTERVIEWING records the
-        answer and asks the next question; DONE runs the Converter.
+        answer and asks the next question; DONE runs the Converter ->
+        Scripter -> Narrator chain (portrait, script text, voice note).
       * anything else -> a "answer in words" nudge mid-interview, else logged
         and ignored.
 
@@ -361,12 +479,17 @@ def handle_update(
         if sender is not None:
             sender.send(decision.reply)
         logger.info("event=replied chat_id=%s via=interview_answer", chat_id)
+        # Auto-trigger: the moment the interview closes, fuse the portrait
+        # and deliver it (plus the narration) without waiting for another
+        # message (ROADMAP Phase 4/5 acceptance).
+        if session.phase is SessionPhase.DONE and converter is not None:
+            _run_converter(chat_id, session, sender, converter, scripter, narrator)
         return decision.reply
 
     # DONE (the interview just closed): run the Converter and send the
     # portrait. Every other later phase has no handler yet, so it just teases.
     if session.phase == SessionPhase.DONE and converter is not None:
-        return _run_converter(chat_id, session, sender, converter)
+        return _run_converter(chat_id, session, sender, converter, scripter, narrator)
 
     # Any later phase (or a Converter that is not wired): point at the
     # portrait without pretending it exists.
@@ -463,6 +586,38 @@ class TelegramSender:
             )
             raise RuntimeError(f"telegram sendPhoto failed: {description!r}")
 
+    def send_voice(self, message: OutboundVoice) -> None:
+        """Upload audio bytes to `sendVoice` as multipart form data.
+
+        Telegram renders `sendVoice` + `audio/ogg` as a playable voice note —
+        `sendAudio`/MP3 would arrive as a file attachment instead, and MP3 is
+        not a valid voice note at all (TECH.md hard requirement). Same
+        secret-safety rule as `send`/`send_photo`: never `raise_for_status()`
+        — the URL carries the bot token (SPECS/MISSION.md).
+        """
+        files = {
+            "voice": (message.filename, message.audio_bytes, message.mime_type)
+        }
+        data: dict[str, str] = {"chat_id": str(message.chat_id)}
+        response = self._client.post(
+            f"{TELEGRAM_API}/bot{self._token}/sendVoice",
+            data=data,
+            files=files,
+            timeout=60.0,
+        )
+        payload = telegram_payload(response)
+        description = payload.get("description") or (
+            f"HTTP {response.status_code} non-json body"
+        )
+        if not response.is_success or not payload.get("ok"):
+            logger.error(
+                "event=send_failed chat_id=%s status=%d description=%r",
+                message.chat_id,
+                response.status_code,
+                description,
+            )
+            raise RuntimeError(f"telegram sendVoice failed: {description!r}")
+
 
 def _raw_update_id(raw: object) -> int | None:
     """`update_id` from an untrusted batch entry, or None if it isn't an int.
@@ -489,6 +644,8 @@ def poll_once(
     classifier: HumanPresenceClassifier | None = None,
     interviewer: Interviewer | None = None,
     converter: Converter | None = None,
+    scripter: Scripter | None = None,
+    narrator: Narrator | None = None,
 ) -> int:
     """Fetch one batch of updates, reply to each, return the next offset.
 
@@ -549,6 +706,8 @@ def poll_once(
                 classifier=classifier,
                 interviewer=interviewer,
                 converter=converter,
+                scripter=scripter,
+                narrator=narrator,
             )
         except Exception:
             # Isolated: log loudly, keep answering the rest of the batch.
@@ -590,10 +749,27 @@ def run(token: str) -> None:
             logger.exception("event=converter_init_failed")
             converter = None  # DONE falls back to the portrait tease
 
+        # Scripter wired
+        try:
+            scripter: Scripter | None = AdkScripter()
+        except Exception:
+            logger.exception("event=scripter_init_failed")
+            scripter = None
+
+        # The Narrator is the same story again, independently: a failure to
+        # construct the plain Gemini client must not stop the rest of the
+        # pipeline (the script text alone is still a complete answer).
+        try:
+            narrator: Narrator | None = GeminiTtsNarrator()
+        except Exception:
+            logger.exception("event=narrator_init_failed")
+            narrator = None
+
         logger.info(
             "event=gateway_started transport=long_polling tracked_chats=%d "
             "bouncer_model=%s bouncer_wired=%s interviewer_model=%s "
-            "interviewer_wired=%s converter_model=%s converter_wired=%s",
+            "interviewer_wired=%s converter_model=%s converter_wired=%s "
+            "scripter_wired=%s narrator_model=%s narrator_wired=%s",
             len(store.chat_ids),
             BOUNCER_MODEL,
             classifier is not None,
@@ -601,6 +777,9 @@ def run(token: str) -> None:
             interviewer is not None,
             CONVERTER_MODEL,
             converter is not None,
+            scripter is not None,
+            NARRATOR_MODEL,
+            narrator is not None,
         )
 
         offset = 0
@@ -615,6 +794,8 @@ def run(token: str) -> None:
                     classifier=classifier,
                     interviewer=interviewer,
                     converter=converter,
+                    scripter=scripter,
+                    narrator=narrator,
                 )
             except httpx.HTTPError:
                 # Log loudly, keep polling (SPECS/TECH.md error policy).
