@@ -61,6 +61,8 @@ class Session:
     original_photo_bytes: bytes | None = None
     original_photo_mime: str | None = None
     original_photo_file_id: str | None = None
+    #: Final narration script, ready for audio synthesis (Phase 5 output).
+    script: str | None = None
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)

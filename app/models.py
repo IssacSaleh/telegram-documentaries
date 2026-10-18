@@ -181,3 +181,8 @@ class InterviewTurn(BaseModel):
                         "suggested_animal must be null when not complete"
                     )
         return data
+
+class Script(BaseModel):
+    """Narration script from Scripter."""
+    model_config = ConfigDict(extra="ignore")
+    text: str = Field(min_length=1, max_length=600)
