@@ -60,15 +60,18 @@ the dossier.
 - **Acceptance:** narration is 60–90 words, derived from the dossier (not a
   generic template), and validated as text before TTS.
 - **Serves:** happy path.
-- **Delivered:** the Scripter lives in `app/scripter.py` as a plain module
-  (direct `google-genai` client, no ADK agent): it builds a Pydantic-validated
+- **Delivered:** the Scripter lives in `app/scripter.py` as an `AdkScripter`
+  class wrapping a Google ADK `LlmAgent`: it builds a Pydantic-validated
   `Script` (`text`, 1–600 chars) from the dossier via the pinned
   `gemini-3.1-flash-lite` model, stores the finished narration on
   `session.script`, and the gateway sends it to the chat as plain text before
   the Narrator runs (spec `SPECS/2026-10-18-voiceover`, decision D2 — the
-  text message stays). Verified by the offline suite
-  (`tests/unit/test_scripter.py`, `tests/unit/test_gateway_scripter.py`,
-  regression green in `./scripts/test`); `./scripts/hooks` clean.
+  text message stays). Verified by the offline suite — the Scripter module
+  (`tests/unit/test_scripter.py`) and the gateway↔Scripter integration
+  (`tests/unit/test_gateway_scripter.py`, regression green in `./scripts/test`)
+  — plus the gated live test (`RUN_LIVE_TESTS=1`,
+  `tests/integration/test_live_scripter.py`, real narration from the pinned
+  model). `./scripts/hooks` clean.
 
 ## 6. Narrator
 
