@@ -7,7 +7,8 @@ from collections.abc import Iterable
 
 import pytest
 
-from app.models import BouncerVerdict, InterviewTurn, OutboundMessage
+from app.models import BouncerVerdict, InterviewTurn, OutboundMessage, OutboundPhoto
+from app.narrator import OutboundVoice
 
 # A realistic Telegram `getUpdates` payload. Deliberately stuffed with extra
 # fields Telegram actually sends but our models do not care about, to prove
@@ -96,7 +97,11 @@ def bot_token() -> str:
 
 
 class RecordingSender:
-    """`MessageSender` double: records every outbound message.
+    """`MessageSender` double: records every outbound message, photo, voice.
+
+    ``events`` appends the kind of each attempt (``"send"``/``"photo"``/
+    ``"voice"``) in call order, so a test can assert the delivery ORDER of
+    portrait -> script text -> voice note across the separate lists.
 
     Chats listed in `fail_on` raise BEFORE a successful send is recorded, so
     a test can model one chat's send failing (e.g. a 403-blocked chat) while
@@ -106,13 +111,33 @@ class RecordingSender:
     def __init__(self, fail_on: Iterable[int] = ()) -> None:
         self.attempts: list[OutboundMessage] = []
         self.sent: list[OutboundMessage] = []
+        self.photo_attempts: list[OutboundPhoto] = []
+        self.photos: list[OutboundPhoto] = []
+        self.voice_attempts: list[OutboundVoice] = []
+        self.voices: list[OutboundVoice] = []
+        self.events: list[str] = []
         self._fail_on = set(fail_on)
 
     def send(self, message: OutboundMessage) -> None:
+        self.events.append("send")
         self.attempts.append(message)
         if message.chat_id in self._fail_on:
             raise RuntimeError(f"send failed for chat {message.chat_id}")
         self.sent.append(message)
+
+    def send_photo(self, message: OutboundPhoto) -> None:
+        self.events.append("photo")
+        self.photo_attempts.append(message)
+        if message.chat_id in self._fail_on:
+            raise RuntimeError(f"send_photo failed for chat {message.chat_id}")
+        self.photos.append(message)
+
+    def send_voice(self, message: OutboundVoice) -> None:
+        self.events.append("voice")
+        self.voice_attempts.append(message)
+        if message.chat_id in self._fail_on:
+            raise RuntimeError(f"send_voice failed for chat {message.chat_id}")
+        self.voices.append(message)
 
 
 class FakePhotoFetcher:
@@ -133,6 +158,41 @@ class ExplodingPhotoFetcher:
 
     def fetch(self, file_id: str) -> tuple[bytes, str]:
         raise RuntimeError("telegram getFile exploded")
+
+
+class FlakyPhotoFetcher:
+    """PhotoFetcher double: succeeds for the Bouncer, fails on the later store.
+
+    The gateway fetches an admitted photo twice — once for classification in
+    `bounce()`, once to stash it for the Converter. This models the second
+    fetch failing (a transient Telegram hiccup) without breaking admission.
+    """
+
+    def __init__(self, data: bytes = b"\xff\xd8fakejpeg", mime: str = "image/jpeg") -> None:
+        self.data = data
+        self.mime = mime
+        self.calls = 0
+
+    def fetch(self, file_id: str) -> tuple[bytes, str]:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("telegram getFile exploded on the second call")
+        return self.data, self.mime
+
+
+class RecordingSleeper:
+    """RetryPolicy sleeper double: records every delay, never really sleeps.
+
+    The retry helper (ROADMAP §7) takes an injectable sleeper so the suite
+    is instant and deterministic; this double records the backoff schedule
+    a test wants to assert on.
+    """
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.delays.append(seconds)
 
 
 class FakeClassifier:
@@ -214,3 +274,93 @@ class ExplodingInterviewer:
 
     def final_turn(self, dossier) -> InterviewTurn:
         raise RuntimeError("gemini 500")
+
+
+class FakeConverter:
+    """`Converter` double: records inputs, returns canned image bytes.
+
+    Proves the gateway passes *all three* Converter inputs together — the
+    original photo bytes/mime, the dossier text, and the suggested animal —
+    without any network call.
+    """
+
+    def __init__(
+        self,
+        image_bytes: bytes = b"\x89PNGfakeportrait",
+        mime_type: str = "image/png",
+    ) -> None:
+        self.image_bytes = image_bytes
+        self.mime_type = mime_type
+        self.calls: list[dict] = []
+
+    def generate(
+        self,
+        *,
+        original_photo_bytes: bytes,
+        original_photo_mime: str,
+        dossier_text: str,
+        suggested_animal: str,
+    ):
+        from app.converter import ConverterResult
+
+        self.calls.append(
+            {
+                "original_photo_bytes": original_photo_bytes,
+                "original_photo_mime": original_photo_mime,
+                "dossier_text": dossier_text,
+                "suggested_animal": suggested_animal,
+            }
+        )
+        return ConverterResult(
+            suggested_animal=suggested_animal,
+            image_bytes=self.image_bytes,
+            image_mime_type=self.mime_type,
+        )
+
+
+class ExplodingConverter:
+    """`Converter` double that models a Gemini image-model failure."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        raise RuntimeError("gemini image 500")
+
+
+class FakeScripter:
+    """Scripter double: returns canned script."""
+
+    def __init__(self, script: str = "A most dramatic tale of a cunning creature.") -> None:
+        self.script = script
+        self.calls: list = []
+
+    def generate_script(self, dossier) -> str:
+        self.calls.append(dossier)
+        return self.script
+
+
+class FakeNarrator:
+    """Narrator double: records the scripts it is asked to render.
+
+    Returns canned bytes — the gateway's contract with the Narrator is to
+    transport whatever *verified* bytes the Narrator returns (SPECS/
+    2026-10-18-voiceover D5); format verification is the Narrator's own
+    boundary and is tested there.
+    """
+
+    def __init__(self, audio_bytes: bytes = b"OggSfakevoicenote") -> None:
+        self.audio_bytes = audio_bytes
+        self.calls: list[str] = []
+
+    def synthesise(self, script: str) -> bytes:
+        self.calls.append(script)
+        return self.audio_bytes
+
+
+class ExplodingNarrator:
+    """Narrator double that models a Gemini TTS failure."""
+
+    def synthesise(self, script: str) -> bytes:
+        raise RuntimeError("gemini tts 500")

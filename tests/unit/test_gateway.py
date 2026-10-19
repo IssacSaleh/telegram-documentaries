@@ -27,14 +27,17 @@ from app.interviewer import (
     PORTRAIT_PENDING_REPLY,
     WRONG_PAYLOAD_PROMPT,
 )
-from app.models import OutboundMessage, TelegramUpdate
+from app.models import OutboundMessage, OutboundPhoto, TelegramUpdate
 from app.state import SessionPhase, get_store
 from tests.conftest import (
     ExplodingClassifier,
+    ExplodingConverter,
     ExplodingPhotoFetcher,
     FakeClassifier,
+    FakeConverter,
     FakeInterviewer,
     FakePhotoFetcher,
+    FlakyPhotoFetcher,
     RecordingSender,
     human_verdict,
     no_human_verdict,
@@ -214,6 +217,98 @@ class TestRestartCommand:
         handle_update(_update(command, chat_id=555))
 
         assert store.get(555) is None
+
+    @pytest.mark.parametrize("command", ["/start", "/restart"])
+    def test_reset_purges_temporary_media_and_logs_the_purge(
+        self, command: str, caplog
+    ) -> None:
+        """ROADMAP §7 acceptance 1: after a mid-pipeline run (photo stored,
+        script set), the reset leaves no session AND no media artifacts
+        (photo bytes/mime/file_id, script) — and the purge is logged."""
+        from tests.conftest import FakeScripter
+
+        store = get_store()
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        sender = RecordingSender()
+        chat_id = 880
+        # Drive a full run: photo stored at admission, script stored by the
+        # Scripter, phases traversed to NARRATING/DONE.
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(5):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=FakeConverter(image_bytes=b"PORTRAIT"),
+                scripter=FakeScripter(script="A quiet narration."),
+            )
+        session = store.get(chat_id)
+        assert session is not None
+        assert session.original_photo_bytes == b"\xff\xd8ORIGINAL"
+        assert session.script == "A quiet narration."
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries.state"):
+            handle_update(_update(command, chat_id=chat_id))
+
+        assert store.get(chat_id) is None, "no session survives the reset"
+        assert any(
+            "event=temp_media_purged" in r.message and f"chat_id={chat_id}" in r.message
+            for r in caplog.records
+        ), "the media purge must be logged for operators"
+
+    @pytest.mark.parametrize("command", ["/start", "/restart"])
+    def test_reset_mid_interview_clears_history_and_media(
+        self, command: str
+    ) -> None:
+        """ROADMAP §7 acceptance 1: a reset mid-conversation must leave no
+        residual user state of any kind — no session, and no conversation
+        history (dossier + open question) or temporary media (photo + script)
+        retained even via a held reference to the old Session."""
+        store = get_store()
+        interviewer = FakeInterviewer()
+        sender = RecordingSender()
+        chat_id = 881
+        # Mid-interview: photo stored, one answer recorded, a question open.
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        handle_update(
+            _update("I collect stamps", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+        )
+        live = store.get(chat_id)
+        assert live is not None
+        assert live.phase is SessionPhase.INTERVIEWING
+        assert live.dossier is not None and live.dossier.answers, "history exists"
+        assert live.pending_question is not None, "an open question exists"
+        assert live.original_photo_bytes == b"\xff\xd8ORIGINAL"
+
+        handle_update(_update(command, chat_id=chat_id))
+
+        assert store.get(chat_id) is None, "no session survives the reset"
+        assert live.dossier is None, "no residual conversation history"
+        assert live.pending_question is None, "no residual open question"
+        assert live.original_photo_bytes is None, "no residual photo"
+        assert live.script is None
+
+        # The very next message is treated as brand new, not resumed.
+        reply = handle_update(_update("hello", chat_id=chat_id))
+        assert reply is not None
+        assert reply.text == PHOTO_PROMPT
+        assert store.get(chat_id) is None, "a reset chat is not registered"
 
 
 class TestReplyIsAuditable:
@@ -638,6 +733,624 @@ class TestInterviewRouting:
 
         assert reply is not None, "never leave a user mid-interview in silence"
         assert reply.text == BouncerFallbackPolicy.ERROR_REPLY
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: stage guards for out-of-order input during the image stage
+# ---------------------------------------------------------------------------
+
+
+class TestImageStageGuards:
+    """ROADMAP §7 / acceptance 3: out-of-order input during the portrait
+    pipeline gets a helpful "sit tight" nudge, leaves the in-flight run
+    untouched, and a photo there is never re-gated as a new submission."""
+
+    IMAGE_PHASES = (
+        SessionPhase.GENERATING_IMAGE,
+        SessionPhase.SCRIPTING,
+        SessionPhase.NARRATING,
+    )
+
+    def _session_in(self, phase: SessionPhase, chat_id: int):
+        store = get_store()
+        session = store.get_or_create(chat_id)
+        session.phase = phase
+        session.pending_question = "What is your quest?"
+        session.original_photo_bytes = b"\xff\xd8ORIGINAL"
+        session.original_photo_mime = "image/jpeg"
+        session.original_photo_file_id = "file-abc"
+        session.script = "A quiet narration."
+        return session
+
+    @pytest.mark.parametrize("phase", IMAGE_PHASES)
+    def test_text_during_the_image_stage_gets_the_busy_nudge(self, phase) -> None:
+        from app.interviewer import IMAGE_STAGE_BUSY_PROMPT
+
+        self._session_in(phase, 620)
+        interviewer = FakeInterviewer()
+
+        reply = handle_update(
+            _update("hello? what's happening?", chat_id=620), interviewer=interviewer
+        )
+
+        assert reply is not None
+        assert reply.text == IMAGE_STAGE_BUSY_PROMPT
+        assert interviewer.next_turn_calls == [], "no model call for stray text"
+
+    @pytest.mark.parametrize("phase", IMAGE_PHASES)
+    def test_text_during_the_image_stage_leaves_state_untouched(self, phase) -> None:
+        session = self._session_in(phase, 621)
+        before_updated = session.updated_at
+
+        handle_update(_update("are you stuck?", chat_id=621))
+
+        assert session.phase is phase
+        assert session.pending_question == "What is your quest?"
+        assert session.original_photo_bytes == b"\xff\xd8ORIGINAL"
+        assert session.script == "A quiet narration."
+        assert session.updated_at == before_updated, "no touch, no mutation"
+
+    @pytest.mark.parametrize("phase", IMAGE_PHASES)
+    def test_photo_during_the_image_stage_gets_the_same_nudge(self, phase) -> None:
+        """A stray photo mid-generation must NOT be treated as a fresh
+        Bouncer submission (it would clobber the in-flight run)."""
+        from app.interviewer import IMAGE_STAGE_BUSY_PROMPT
+
+        session = self._session_in(phase, 622)
+        fetcher = FakePhotoFetcher()
+        classifier = FakeClassifier(human_verdict())
+
+        reply = handle_update(
+            _photo_update(622, update_id=90),
+            fetcher=fetcher,
+            classifier=classifier,
+        )
+
+        assert reply is not None
+        assert reply.text == IMAGE_STAGE_BUSY_PROMPT
+        assert classifier.received == [], "the Bouncer must not re-gate the photo"
+        assert fetcher.requested == [], "no photo may be fetched"
+        assert session.phase is phase
+        assert session.original_photo_bytes == b"\xff\xd8ORIGINAL"
+        assert session.script == "A quiet narration."
+
+    def test_sticker_during_the_image_stage_gets_the_same_nudge(self) -> None:
+        from app.interviewer import IMAGE_STAGE_BUSY_PROMPT
+
+        self._session_in(SessionPhase.NARRATING, 623)
+        sticker = TelegramUpdate.model_validate(
+            {
+                "update_id": 91,
+                "message": {
+                    "message_id": 91,
+                    "date": 1,
+                    "chat": {"id": 623, "type": "private"},
+                    "sticker": {"file_id": "s", "file_unique_id": "u",
+                                "width": 512, "height": 512, "type": "regular"},
+                },
+            }
+        )
+
+        reply = handle_update(sticker)
+
+        assert reply is not None
+        assert reply.text == IMAGE_STAGE_BUSY_PROMPT
+
+    @pytest.mark.parametrize("phase", IMAGE_PHASES)
+    def test_the_nudge_is_sent_through_the_sender(self, phase) -> None:
+        self._session_in(phase, 624)
+        sender = RecordingSender()
+
+        handle_update(_update("hi", chat_id=624), sender)
+
+        assert len(sender.sent) == 1, "exactly one reply goes out"
+
+    @pytest.mark.parametrize(
+        "phase", [SessionPhase.AWAITING_CONFIRMATION, SessionPhase.INTERVIEWING]
+    )
+    @pytest.mark.parametrize("kind", ["photo", "sticker"])
+    def test_wrong_payload_mid_interview_nudges_and_keeps_the_pending_question(
+        self, phase, kind
+    ) -> None:
+        """Regression (existing guard, now locked in): a photo/sticker in
+        the interview phases keeps the conversation able to continue."""
+        store = get_store()
+        session = store.get_or_create(625)
+        session.phase = phase
+        session.pending_question = "Question 1?"
+
+        if kind == "photo":
+            update = _photo_update(625, update_id=92)
+        else:
+            update = TelegramUpdate.model_validate(
+                {
+                    "update_id": 92,
+                    "message": {
+                        "message_id": 92,
+                        "date": 1,
+                        "chat": {"id": 625, "type": "private"},
+                        "sticker": {"file_id": "s", "file_unique_id": "u",
+                                    "width": 512, "height": 512, "type": "regular"},
+                    },
+                }
+            )
+
+        reply = handle_update(update)
+
+        assert reply is not None
+        assert reply.text == WRONG_PAYLOAD_PROMPT
+        assert session.pending_question == "Question 1?", "pending question preserved"
+        assert session.phase is phase
+
+
+# ---------------------------------------------------------------------------
+# Phase 7, group 5: an *exhausted* Gemini retry through the whole gateway
+# ---------------------------------------------------------------------------
+#
+# The adapter-level tests prove a transient timeout is retried and, once the
+# attempts are spent, re-raised unchanged. These two doubles model that
+# exhaustion at the boundary — the timeout the gateway actually sees once
+# `call_with_retries` gives up. Acceptance 4: no exception may escape
+# `handle_update`, the session stays alive, and the user gets a friendly
+# reply from the existing per-stage degrade path.
+
+
+class _TimeoutClassifier:
+    """Bouncer double whose Gemini call exhausted its retries."""
+
+    def classify(self, image_bytes: bytes, mime_type: str) -> object:
+        raise TimeoutError("gemini timed out")
+
+
+class _TimeoutInterviewer:
+    """Interviewer double whose Gemini call exhausted its retries."""
+
+    def next_turn(self, dossier) -> object:
+        raise TimeoutError("gemini timed out")
+
+    def final_turn(self, dossier) -> object:
+        raise TimeoutError("gemini timed out")
+
+
+class TestEndToEndResilience:
+    """ROADMAP §7 acceptance 4, end to end: a Gemini timeout that survives
+    every retry degrades to a friendly reply and never raises out of
+    `handle_update`; the session stays alive so the conversation continues."""
+
+    def _admit(self, sender, chat_id: int, interviewer) -> None:
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+
+    def test_a_timed_out_interview_turn_degrades_to_retry_without_raising(
+        self,
+    ) -> None:
+        from app.interviewer import RETRY_PROMPT
+
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        self._admit(sender, 900, interviewer)
+        handle_update(_update("yes", chat_id=900), sender, interviewer=interviewer)
+        sender.sent.clear()
+
+        reply = handle_update(
+            _update("an answer", chat_id=900),
+            sender,
+            interviewer=_TimeoutInterviewer(),
+        )
+
+        assert reply is not None, "a timed-out turn must not be silent"
+        assert reply.text == RETRY_PROMPT
+        assert sender.sent == [reply]
+        session = store.get(900)
+        assert session is not None, "the session must survive the timeout"
+        assert session.phase is SessionPhase.INTERVIEWING, "still able to continue"
+        assert session.pending_question == "Question 1?", "open question preserved"
+
+    def test_a_timed_out_bouncer_classification_degrades_without_raising(self) -> None:
+        from app.gateway import BouncerFallbackPolicy
+
+        store = get_store()
+        sender = RecordingSender()
+
+        reply = handle_update(
+            _photo_update(901),
+            sender,
+            fetcher=FakePhotoFetcher(),
+            classifier=_TimeoutClassifier(),
+        )
+
+        assert reply is not None, "a timed-out classification must not be silent"
+        assert reply.text == BouncerFallbackPolicy.ERROR_REPLY
+        assert sender.sent == [reply]
+        assert store.get(901) is None, "the degrade path creates no session"
+
+    def test_a_fresh_run_after_restart_behaves_like_a_first_run(self) -> None:
+        """Acceptance 1 + 2 combined: a full run leaves media behind; a
+        `/restart` purges it; the very next photo+interview then proceeds
+        exactly like the first run (fresh dossier, no residual media)."""
+        from tests.conftest import FakeScripter
+
+        store = get_store()
+        sender = RecordingSender()
+        interviewer = FakeInterviewer()
+        chat_id = 902
+
+        # A full run: photo -> interview -> portrait -> script.
+        self._admit(sender, chat_id, interviewer)
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(5):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=FakeConverter(image_bytes=b"PORTRAIT"),
+                scripter=FakeScripter(script="A quiet narration."),
+            )
+        done = store.get(chat_id)
+        assert done is not None
+        assert done.script == "A quiet narration."
+        assert done.original_photo_bytes == b"\xff\xd8fakejpeg"
+
+        # The reset purges the session and its media.
+        handle_update(_update("/restart", chat_id=chat_id))
+        assert store.get(chat_id) is None
+
+        # The next run proceeds exactly like a first one.
+        self._admit(sender, chat_id, interviewer)
+        fresh = store.get(chat_id)
+        assert fresh is not None
+        assert fresh.phase is SessionPhase.AWAITING_CONFIRMATION
+        assert fresh.dossier is not None
+        assert fresh.dossier.asked == 0, "a brand-new dossier, nothing resumed"
+        assert fresh.dossier.answers == []
+        assert fresh.original_photo_bytes == b"\xff\xd8fakejpeg"
+        assert fresh.script is None, "no residual script from the prior run"
+
+        reply = handle_update(
+            _update("yes", chat_id=chat_id), sender, interviewer=interviewer
+        )
+        assert reply is not None
+        assert reply.text == "Question 1?"
+        assert store.get(chat_id).phase is SessionPhase.INTERVIEWING
+        assert store.get(chat_id).dossier.asked == 0, "dossier starts at zero"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: the Converter (DONE -> portrait sent straight to Telegram)
+# ---------------------------------------------------------------------------
+
+
+class TestConverterRouting:
+    """DONE with a wired Converter fuses photo + dossier + animal and sends it.
+
+    SPECS/2026-10-17-converter: auto-trigger when the interview finishes,
+    one multimodal request with all three inputs, the image returned directly
+    to Telegram, no intermediate text hop, and graceful failure.
+    """
+
+    def _finish_interview(
+        self, sender: RecordingSender, chat_id: int, animal: str = "Red Fox"
+    ) -> FakeInterviewer:
+        """Drive a chat through admission to DONE, storing a photo along the way."""
+        interviewer = FakeInterviewer([], animal=animal)
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(5):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+            )
+        assert get_store().get(chat_id).phase is SessionPhase.DONE
+        return interviewer
+
+    def test_done_phase_sends_the_portrait_and_returns_no_text(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        chat_id = 700
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        sender.photos.clear()
+
+        reply = handle_update(
+            _update("what now?", chat_id=chat_id), sender, converter=converter
+        )
+
+        assert reply is None, "the portrait is the reply, not a text message"
+        assert len(sender.photos) == 1
+        assert sender.photos[0].image_bytes == b"PORTRAIT"
+        assert sender.photos[0].chat_id == chat_id
+        assert store.get(chat_id).phase is SessionPhase.DONE
+
+    def test_converter_receives_all_three_inputs_together(self) -> None:
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 701
+        self._finish_interview(sender, chat_id, animal="Arctic Fox")
+
+        handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert len(converter.calls) == 1
+        call = converter.calls[0]
+        # (1) the original photo, fetched at admission
+        assert call["original_photo_bytes"] == b"\xff\xd8ORIGINAL"
+        assert call["original_photo_mime"] == "image/jpeg"
+        # (2) the dossier summary, derived from the interview answers
+        assert "an answer" in call["dossier_text"]
+        # (3) the suggested animal from the Interviewer
+        assert call["suggested_animal"] == "Arctic Fox"
+
+    def test_portrait_caption_names_the_suggested_animal(self) -> None:
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 702
+        self._finish_interview(sender, chat_id, animal="Snowy Owl")
+        sender.photos.clear()
+
+        handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert sender.photos[0].caption is not None
+        assert "Snowy Owl" in sender.photos[0].caption
+
+    def test_final_answer_auto_triggers_the_portrait(self) -> None:
+        """The image must arrive with the last answer — no extra message."""
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 710
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+        sender.photos.clear()
+
+        # Fifth answer completes the interview: portrait fires in THIS update.
+        handle_update(
+            _update("an answer", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+            converter=converter,
+        )
+
+        assert store.get(chat_id).phase is SessionPhase.DONE
+        assert len(sender.photos) == 1, "portrait must be sent with the last answer"
+        assert sender.photos[0].image_bytes == b"PORTRAIT"
+
+    def test_final_answer_auto_triggers_the_narration_script(self) -> None:
+        """The Scripter's narration follows the portrait automatically."""
+        from tests.conftest import FakeScripter
+
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        scripter = FakeScripter(script="In the quiet hours, a fox-like soul stirs.")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 711
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+        sender.sent.clear()
+        sender.photos.clear()
+
+        handle_update(
+            _update("an answer", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+            converter=converter,
+            scripter=scripter,
+        )
+
+        assert len(scripter.calls) == 1, "script must be generated from the dossier"
+        assert len(sender.photos) == 1
+        assert sender.sent[-1].text == "In the quiet hours, a fox-like soul stirs."
+        # Portrait (photo) is delivered before the narration (text).
+        assert sender.photos and sender.sent
+
+        # The raw script is cleanly captured on the session, ready for
+        # audio synthesis (Phase 6 Narrator).
+        session = get_store().get(chat_id)
+        assert session.script == "In the quiet hours, a fox-like soul stirs."
+        assert session.script.strip() == session.script, "no stray whitespace"
+        assert "\n" not in session.script, "single paragraph only"
+        assert len(session.script.split()) <= 90, "≤90 words for TTS"
+
+    def test_script_capture_is_visible_in_the_console_log(self, caplog) -> None:
+        """The ops-visible line: chars, words, and that state stored it."""
+        from tests.conftest import FakeScripter
+
+        sender = RecordingSender()
+        converter = FakeConverter(image_bytes=b"PORTRAIT")
+        scripter = FakeScripter(script="A quiet narration of the wild couch.")
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        chat_id = 713
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(4):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+            )
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries"):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+                converter=converter,
+                scripter=scripter,
+            )
+
+        captured_lines = [
+            r.message
+            for r in caplog.records
+            if "event=script_captured" in r.message
+        ]
+        assert captured_lines, "script_captured must appear in the console log"
+        line = captured_lines[0]
+        assert f"chat_id={chat_id}" in line
+        assert "words=" in line
+        assert "session_script_stored=True" in line
+
+    def test_converter_failure_degrades_without_killing_the_session(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = ExplodingConverter()
+        chat_id = 703
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        sender.sent.clear()
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert reply is not None, "never leave the user in silence on a failure"
+        assert sender.photos == []
+        assert store.get(chat_id).phase is SessionPhase.DONE
+
+    def test_missing_original_photo_teases_instead_of_calling_the_converter(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        converter = FakeConverter()
+        chat_id = 704
+        self._finish_interview(sender, chat_id, animal="Red Fox")
+        # Simulate a photo that could not be fetched at admission time.
+        store.get(chat_id).original_photo_bytes = None
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=converter)
+
+        assert converter.calls == []
+        assert reply is not None
+        assert reply.text == PORTRAIT_PENDING_REPLY
+
+    def test_done_without_a_converter_still_teases(self) -> None:
+        sender = RecordingSender()
+        chat_id = 705
+        self._finish_interview(sender, chat_id)
+
+        reply = handle_update(_update("go", chat_id=chat_id), sender, converter=None)
+
+        assert reply is not None
+        assert reply.text == PORTRAIT_PENDING_REPLY
+
+    def test_admission_stores_the_original_photo(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        fetcher = FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg")
+        chat_id = 706
+
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=fetcher,
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
+        )
+
+        session = store.get(chat_id)
+        assert session.original_photo_bytes == b"\xff\xd8ORIGINAL"
+        assert session.original_photo_mime == "image/jpeg"
+        assert session.original_photo_file_id == "largest"
+
+    def test_admission_survives_a_photo_fetch_failure(self) -> None:
+        store = get_store()
+        sender = RecordingSender()
+        chat_id = 707
+
+        reply = handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FlakyPhotoFetcher(),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=FakeInterviewer(),
+        )
+
+        assert reply is not None, "a fetch failure must not stall the interview"
+        assert store.get(chat_id).original_photo_bytes is None
+        assert store.get(chat_id).phase is SessionPhase.AWAITING_CONFIRMATION
+
+
+class TestTelegramSenderSendPhoto:
+    def test_ok_true_returns_without_raising(self) -> None:
+        client = _client_returning(
+            {"ok": True, "result": {"message_id": 1, "chat": {"id": 555}, "date": 1}}
+        )
+        sender = TelegramSender(token="123:TOKEN", client=client)
+
+        sender.send_photo(
+            OutboundPhoto(chat_id=555, image_bytes=b"\x89PNG", mime_type="image/png")
+        )  # must not raise
+
+    def test_ok_false_raises_with_telegrams_description(self) -> None:
+        client = _client_returning(
+            {"ok": False, "description": "Bad Request: chat not found"}
+        )
+        sender = TelegramSender(token="123:TOKEN", client=client)
+
+        with pytest.raises(RuntimeError, match="sendPhoto failed") as exc_info:
+            sender.send_photo(OutboundPhoto(chat_id=555, image_bytes=b"x"))
+
+        assert "chat not found" in str(exc_info.value)
+
+    def test_sends_image_bytes_as_multipart(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["content_type"] = request.headers.get("content-type", "")
+            captured["body"] = request.read()
+            return httpx.Response(
+                200, json={"ok": True, "result": {"message_id": 1}}, request=request
+            )
+
+        sender = TelegramSender(
+            token="123:TOKEN", client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        sender.send_photo(
+            OutboundPhoto(chat_id=555, image_bytes=b"IMAGEDATA", caption="hi")
+        )
+
+        assert "multipart/form-data" in captured["content_type"]
+        assert b"IMAGEDATA" in captured["body"]
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,9 @@
 > pinned here; it must be supplied by the user before that phase is built.
 
 Runtime dependencies are pinned in `requirements.txt`; the Bouncer adds
-`google-adk` (which pulls `google-genai` in transit).
+`google-adk` (which pulls `google-genai` in transit), and the Narrator adds
+`soundfile` (bundles libsndfile — no system encoder exists in this
+environment) for PCM → OGG/Opus conversion.
 
 ## Architecture
 
@@ -48,6 +50,23 @@ output_schema=BouncerVerdict)`; the structured response is validated into
 Classification is synchronous (`asyncio.run`) because the gateway is a
 synchronous long-poll loop.
 
+### Narrator (delivered)
+
+**Not an agent.** The finished script is routed straight to Gemini TTS
+(pinned `gemini-3.1-flash-tts-preview`) through the plain `google-genai`
+client — direct `models.generate_content`, no `LlmAgent`, no runner, like
+`GenAiConverter`. Voice: the prebuilt deep-male `Charon` preset plus a
+style instruction wrapping the script (dramatic, posh British wildlife-
+documentary narrator). The model returns raw PCM (`audio/l16;
+rate=24000; channels=1`), so `app/narrator.py` converts it to OGG/Opus
+in memory via `soundfile`/libsndfile (no system encoder in this
+environment, no temp files) and **magic-byte-verifies its own output**
+(`OggS` at offset 0, `OpusHead` inside the first page) before anything
+reaches Telegram. The gateway sends it with `sendVoice` (multipart,
+`voice.ogg`, `audio/ogg`) so Telegram renders it as a playable voice
+note — never `sendAudio`/MP3. Every failure (TTS, conversion, send)
+degrades to a friendly reply and lands the session in `DONE`.
+
 ## Contracts at boundaries
 
 - Parse Telegram updates, Gemini responses, and TTS output into **typed Pydantic
@@ -66,6 +85,18 @@ synchronous long-poll loop.
   gracefully** so the conversation continues. Retry with backoff first; if it
   still fails, send a friendly message and keep the session alive. **Never raise
   into the user's flow.**
+- The retry policy is one shared helper, `app/resilience.py`
+  (`call_with_retries`, frozen `RetryPolicy`): at most `max_attempts=3` calls
+  with capped exponential backoff (`min(base_delay * factor**n, max_delay)`,
+  `0.5s → 1.0s`, cap `4.0s`). Only **transient** errors are retried —
+  name/status-based (`timeout`/`deadline`, `httpx` timeouts, HTTP
+  `429/500/502/503/504`); deterministic errors re-raise immediately. On
+  exhaustion the last error is re-raised **unchanged** for the caller's stage
+  fallback. It is applied *inside* the five concrete Gemini adapters (Bouncer,
+  Interviewer, Converter, Scripter, Narrator) — never in the gateway. The
+  sleeper is injectable so tests never sleep; logs carry the error *type* only
+  (`event=gemini_retry`, `event=gemini_retry_exhausted`) — never free-form
+  exception text, which could embed a secret.
 - Prohibited: bare `except: pass`, swallowed exceptions, un-logged fallbacks.
 
 ## Secret-safe transport
@@ -84,7 +115,14 @@ and report HTTP status plus Telegram's `description` instead.
 - Versioned, per-`chat_id` schema. Never share state across chat IDs.
 - **One shared state driver** — stages do not each invent their own storage.
 - `/start` and `/restart` purge session state and temporary media, without
-  restarting the process.
+  restarting the process. `/start` and `/restart` take precedence in *any*
+  phase. The purge is explicit: `Session.purge()` clears the conversation
+  history (dossier, open question) **and** the media (photo
+  bytes/mime/file_id, script), `SessionStore.reset()` logs
+  `event=temp_media_purged`, then the session is dropped. There are **no
+  on-disk temp files** and **no background tasks** (the loop is synchronous
+  and single-threaded), so the in-memory session is the only owner of a
+  chat's transient artifacts.
 
 ### State machine phases
 
@@ -102,6 +140,13 @@ explicitly; nothing advances by inferring progress from message history.
 
 Any message arriving in the wrong phase is handled by the wrong-payload guard
 (ROADMAP phase 7), not by crashing or silently stalling.
+
+While the portrait pipeline is in flight (`GENERATING_IMAGE`, `SCRIPTING`,
+`NARRATING`) a **stage guard** answers text *or* a stray photo with a single
+"sit tight" nudge (`IMAGE_STAGE_BUSY_PROMPT`), mutating no session state and
+never re-gating the photo through the Bouncer (which would clobber the run).
+`IMAGE_STAGE_PHASES` / `handle_wrong_stage` own this; it is checked in
+`handle_update` after the reset commands, so `/start` and `/restart` still win.
 
 ## Testing
 

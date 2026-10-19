@@ -11,7 +11,18 @@ SPECS/TECH.md Session state:
 
 from __future__ import annotations
 
-from app.state import SessionPhase, SessionStore, get_store
+import logging
+
+from app.state import Session, SessionPhase, SessionStore, get_store
+
+
+def _populate_media(session: Session) -> Session:
+    """Fill every media field the pipeline stashes on a live session."""
+    session.original_photo_bytes = b"\xff\xd8photo"
+    session.original_photo_mime = "image/jpeg"
+    session.original_photo_file_id = "file-abc"
+    session.script = "A dramatic narration."
+    return session
 
 
 class TestPhaseEnum:
@@ -87,6 +98,159 @@ class TestReset:
 
         assert 222 in store.chat_ids
         assert store.get_or_create(222).phase is SessionPhase.INTERVIEWING
+
+    def test_reset_purges_the_chats_temporary_media(self, caplog) -> None:
+        """ROADMAP §7 / acceptance 1: reset must drop the media the session
+        owned (photo bytes/mime/file_id + script), not just the dict entry,
+        and the purge must be logged."""
+        store = SessionStore()
+        _populate_media(store.get_or_create(111))
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries.state"):
+            store.reset(111)
+
+        assert 111 not in store.chat_ids
+        assert any(
+            "event=temp_media_purged" in r.message and "chat_id=111" in r.message
+            for r in caplog.records
+        ), "the media purge must be visible to operators"
+
+    def test_reset_clears_media_fields_before_dropping_the_session(self) -> None:
+        """The Session object must not keep media alive via any other
+        reference after the purge — the bytes themselves must be gone."""
+        store = SessionStore()
+        session = _populate_media(store.get_or_create(111))
+
+        store.reset(111)
+
+        assert session.original_photo_bytes is None
+        assert session.original_photo_mime is None
+        assert session.original_photo_file_id is None
+        assert session.script is None
+
+    def test_reset_of_an_unknown_chat_logs_no_purge(self, caplog) -> None:
+        store = SessionStore()
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries.state"):
+            store.reset(999)
+
+        assert not any("event=temp_media_purged" in r.message for r in caplog.records)
+
+    def test_reset_is_idempotent(self) -> None:
+        store = SessionStore()
+        _populate_media(store.get_or_create(111))
+
+        store.reset(111)
+        store.reset(111)  # must not raise
+
+        assert store.chat_ids == set()
+
+
+class TestClearMedia:
+    def test_clears_every_media_field(self) -> None:
+        session = _populate_media(Session(chat_id=111))
+
+        session.clear_media()
+
+        assert session.original_photo_bytes is None
+        assert session.original_photo_mime is None
+        assert session.original_photo_file_id is None
+        assert session.script is None
+
+    def test_preserves_phase_dossier_and_pending_question(self) -> None:
+        """Media purge is not a state reset — the interview in progress
+        (phase, dossier, pending question) must survive."""
+        session = _populate_media(Session(chat_id=111))
+        session.phase = SessionPhase.NARRATING
+        session.pending_question = "What is your spirit animal?"
+        from app.models import Dossier
+
+        dossier = Dossier(suggested_animal="Red Fox")
+        session.dossier = dossier
+
+        session.clear_media()
+
+        assert session.phase is SessionPhase.NARRATING
+        assert session.pending_question == "What is your spirit animal?"
+        assert session.dossier is dossier
+
+    def test_touches_the_session(self) -> None:
+        session = _populate_media(Session(chat_id=111))
+        before = session.updated_at
+
+        session.clear_media()
+
+        assert session.updated_at >= before
+
+    def test_is_idempotent(self) -> None:
+        session = _populate_media(Session(chat_id=111))
+
+        session.clear_media()
+        session.clear_media()  # must not raise
+
+        assert session.original_photo_bytes is None
+
+
+class TestPurge:
+    """ROADMAP §7: a reset drops the *whole* chat — conversation history
+    (dossier + open question) as well as temporary media — not just the dict
+    entry. There are no background tasks to cancel (the loop is synchronous);
+    `purge()` is the explicit, testable clear-point `reset()` uses."""
+
+    def _mid_conversation(self) -> Session:
+        from app.models import Dossier, DossierAnswer
+
+        session = _populate_media(Session(chat_id=111))
+        session.phase = SessionPhase.INTERVIEWING
+        session.pending_question = "What is your spirit animal?"
+        session.dossier = Dossier(
+            answers=[DossierAnswer(question="Q1?", answer="A1")],
+            suggested_animal="Red Fox",
+        )
+        return session
+
+    def test_clears_conversation_history_and_media(self) -> None:
+        session = self._mid_conversation()
+
+        session.purge()
+
+        assert session.dossier is None, "conversation history must be gone"
+        assert session.pending_question is None, "the open question must be gone"
+        assert session.original_photo_bytes is None
+        assert session.original_photo_mime is None
+        assert session.original_photo_file_id is None
+        assert session.script is None
+
+    def test_reset_clears_a_held_reference_too(self) -> None:
+        """Dropping the store entry must not be the *only* cleanup: a held
+        reference to the old Session must not retain the user's data."""
+        from app.models import Dossier, DossierAnswer
+
+        store = SessionStore()
+        session = store.get_or_create(111)
+        _populate_media(session)
+        session.phase = SessionPhase.INTERVIEWING
+        session.pending_question = "What is your spirit animal?"
+        session.dossier = Dossier(
+            answers=[DossierAnswer(question="Q1?", answer="A1")],
+            suggested_animal="Red Fox",
+        )
+
+        store.reset(111)
+
+        assert store.get(111) is None
+        assert session.dossier is None
+        assert session.pending_question is None
+        assert session.original_photo_bytes is None
+        assert session.script is None
+
+    def test_is_idempotent(self) -> None:
+        session = self._mid_conversation()
+
+        session.purge()
+        session.purge()  # must not raise
+
+        assert session.dossier is None
 
 
 class TestGlobalDriver:

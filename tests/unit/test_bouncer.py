@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from app.bouncer import (
     BOUNCER_INSTRUCTION,
     BOUNCER_MODEL,
@@ -22,6 +24,7 @@ from app.bouncer import (
     bounce,
 )
 from app.models import BouncerVerdict, TelegramUpdate
+from tests.conftest import RecordingSleeper
 
 # ---------------------------------------------------------------------------
 # helpers / doubles
@@ -342,6 +345,85 @@ class TestAdkWiring:
         assert "body" in instruction
         # Classification only — no narration, no TTS, no video (MISSION.md).
         assert "video" not in instruction
+
+
+class TestClassifyRetries:
+    """ROADMAP §7: a transient Gemini timeout in `classify` is retried with
+    backoff; success is byte-for-byte the same verdict, and exhaustion
+    re-raises the timeout unchanged for `bounce()`'s degrade path."""
+
+    def test_transient_timeout_is_retried_then_the_verdict_returns(
+        self, monkeypatch
+    ) -> None:
+        sleeper = RecordingSleeper()
+        classifier = AdkHumanPresenceClassifier(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def flaky_classify(self, image_bytes, mime_type):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise TimeoutError("gemini deadline exceeded")
+            return human()
+
+        monkeypatch.setattr(AdkHumanPresenceClassifier, "_classify_async", flaky_classify)
+
+        verdict = classifier.classify(b"\xff\xd8fake", "image/jpeg")
+
+        assert verdict.human_present is True
+        assert verdict.confidence == 0.98
+        assert attempts["n"] == 2
+        assert sleeper.delays == [0.5], "one capped backoff sleep before the retry"
+
+    def test_a_first_try_success_sleeps_nothing(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        classifier = AdkHumanPresenceClassifier(sleeper=sleeper)
+
+        async def instant_classify(self, image_bytes, mime_type):
+            return human()
+
+        monkeypatch.setattr(
+            AdkHumanPresenceClassifier, "_classify_async", instant_classify
+        )
+
+        verdict = classifier.classify(b"\xff\xd8fake", "image/jpeg")
+
+        assert verdict.human_present is True
+        assert sleeper.delays == [], "no sleep when nothing failed"
+
+    def test_exhaustion_reraises_the_timeout_unchanged(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        classifier = AdkHumanPresenceClassifier(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def always_times_out(self, image_bytes, mime_type):
+            attempts["n"] += 1
+            raise TimeoutError("gemini deadline exceeded")
+
+        monkeypatch.setattr(
+            AdkHumanPresenceClassifier, "_classify_async", always_times_out
+        )
+
+        with pytest.raises(TimeoutError, match="deadline exceeded"):
+            classifier.classify(b"\xff\xd8fake", "image/jpeg")
+
+        assert attempts["n"] == 3, "bounded: at most max_attempts calls"
+
+    def test_a_deterministic_error_is_not_retried(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        classifier = AdkHumanPresenceClassifier(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def invalid(self, image_bytes, mime_type):
+            attempts["n"] += 1
+            raise ValueError("validation failed")
+
+        monkeypatch.setattr(AdkHumanPresenceClassifier, "_classify_async", invalid)
+
+        with pytest.raises(ValueError, match="validation failed"):
+            classifier.classify(b"\xff\xd8fake", "image/jpeg")
+
+        assert attempts["n"] == 1, "deterministic errors propagate immediately"
+        assert sleeper.delays == []
 
 
 class TestAdkResponseParsing:

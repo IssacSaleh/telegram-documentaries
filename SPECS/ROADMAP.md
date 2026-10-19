@@ -60,6 +60,15 @@ the dossier.
 - **Acceptance:** narration is 60–90 words, derived from the dossier (not a
   generic template), and validated as text before TTS.
 - **Serves:** happy path.
+- **Delivered:** the Scripter lives in `app/scripter.py` as a plain module
+  (direct `google-genai` client, no ADK agent): it builds a Pydantic-validated
+  `Script` (`text`, 1–600 chars) from the dossier via the pinned
+  `gemini-3.1-flash-lite` model, stores the finished narration on
+  `session.script`, and the gateway sends it to the chat as plain text before
+  the Narrator runs (spec `SPECS/2026-10-18-voiceover`, decision D2 — the
+  text message stays). Verified by the offline suite
+  (`tests/unit/test_scripter.py`, `tests/unit/test_gateway_scripter.py`,
+  regression green in `./scripts/test`); `./scripts/hooks` clean.
 
 ## 6. Narrator
 
@@ -70,6 +79,25 @@ the dossier.
   valid OGG/Opus (**not** MP3 — Telegram voice notes require OGG/Opus); a TTS
   failure degrades gracefully.
 - **Serves:** happy path (final deliverable).
+- **Delivered:** `app/narrator.py` (plain module, not an agent) calls
+  `gemini-3.1-flash-tts-preview` directly through the `google-genai` client —
+  pinned model, `response_modalities=["AUDIO"]`, prebuilt deep-male `Charon`
+  voice plus a dramatic posh-British style instruction wrapping the script.
+  The raw PCM it returns (`audio/l16; rate=24000; channels=1`) is converted
+  to **OGG/Opus** in memory via the pip `soundfile` package (bundles
+  libsndfile; this environment has no system Opus encoder) and
+  magic-byte-verified (`OggS` + `OpusHead` in the first page) before being
+  sent with `sendVoice` (multipart, `voice.ogg`, `audio/ogg`) so Telegram
+  renders a playable voice note. Auto-triggered right after the Scripter
+  (portrait → script text → voice note); phases
+  `GENERATING_IMAGE → SCRIPTING → NARRATING → DONE`, every failure branch
+  landing `DONE` with a friendly reply. Verified by the offline suite
+  (`tests/unit/test_narrator.py`, `tests/unit/test_gateway_narrator.py`,
+  `tests/unit/test_gateway_voice.py`, secret hygiene) plus the gated live
+  TTS test (`RUN_LIVE_TESTS=1`, `tests/integration/test_live_narrator.py`
+  — real synthesis to verified OGG/Opus). **Pending:** a human end-to-end
+  playability check in the live Telegram bot (voice note rendering) was
+  not performed in this environment. `./scripts/hooks` clean.
 
 ## 7. Resilience
 
@@ -85,3 +113,27 @@ the dossier.
   timeout never raises into the user's flow.
 - **Serves:** `/restart` reset criterion; graceful out-of-order handling;
   error-policy contract.
+- **Delivered:** a shared retry helper, `app/resilience.py` —
+  `RetryPolicy` (frozen; `max_attempts=3`, `base_delay=0.5`, `factor=2.0`,
+  `max_delay=4.0`), name/status-based `is_transient_error`, and
+  `call_with_retries(...)` (injectable sleeper; logs `event=gemini_retry` per
+  retry and `event=gemini_retry_exhausted` on give-up, error *type* only). It
+  wraps the single Gemini call inside all five boundaries — Bouncer
+  `classify`, Interviewer `next_turn`/`final_turn`, Converter `generate`,
+  Scripter `generate_script`, Narrator `synthesise` — never in the gateway,
+  whose existing per-stage degrade paths turn an exhausted retry into a
+  friendly reply. `Session.purge()` + `SessionStore.reset()` clear the
+  session's conversation history (dossier, open question) and its
+  photo bytes/mime/file_id and script, log `event=temp_media_purged`, then
+  drop the session (no background tasks exist to cancel — the loop is
+  synchronous). Stage guards
+  (`IMAGE_STAGE_PHASES`, `handle_wrong_stage`, `IMAGE_STAGE_BUSY_PROMPT`)
+  answer text *and* a stray photo during `GENERATING_IMAGE`/`SCRIPTING`/
+  `NARRATING` with one "sit tight" nudge, mutating no state and never
+  re-gating the photo through the Bouncer; `/start` and `/restart` still take
+  precedence in any phase. Verified by the offline suite
+  (`tests/unit/test_resilience.py`, `test_state.py`, `test_gateway.py`,
+  `test_bouncer.py`, `test_interviewer.py`, `test_converter.py`,
+  `test_scripter.py`, `test_narrator.py`) — all four acceptance criteria
+  covered, including exhausted-timeout end-to-end through `handle_update` —
+  `./scripts/hooks` clean.

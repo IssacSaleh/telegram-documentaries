@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from enum import Enum, auto
 from threading import RLock
 
+from app.logging_utils import get_logger
 from app.models import Dossier
+
+logger = get_logger("state")
 
 
 class SessionPhase(Enum):
@@ -58,9 +61,46 @@ class Session:
     )
     dossier: Dossier | None = None
     pending_question: str | None = None
+    original_photo_bytes: bytes | None = None
+    original_photo_mime: str | None = None
+    original_photo_file_id: str | None = None
+    #: Final narration script, ready for audio synthesis (Phase 5 output).
+    script: str | None = None
 
     def touch(self) -> None:
         self.updated_at = datetime.now(timezone.utc)
+
+    def clear_media(self) -> None:
+        """Purge the temporary media this session owns (ROADMAP §7).
+
+        "Temporary media" is everything the pipeline stashed in memory for
+        this chat — the original photo bytes/mime/file_id and the finished
+        script. There are no on-disk temp files anywhere (SPECS/TECH.md),
+        so this session is their only owner; clearing here is the single
+        purge point. Phase/dossier/pending question are left alone — media
+        cleanup is not a state reset.
+        """
+        self.original_photo_bytes = None
+        self.original_photo_mime = None
+        self.original_photo_file_id = None
+        self.script = None
+        self.touch()
+
+    def purge(self) -> None:
+        """Drop everything this chat owns: conversation history *and* media.
+
+        `SessionStore.reset()` calls this before discarding the session, so
+        a reset clears the user's residual state explicitly rather than
+        relying solely on dropping the dict entry. "Conversation history" is
+        the dossier (answers + rationale) and the open ``pending_question``;
+        "temporary media" is the photo bytes/mime/file_id and the script.
+        There are no background tasks to cancel: the loop is synchronous and
+        single-threaded (SPECS/TECH.md, Session state).
+        """
+        self.clear_media()
+        self.dossier = None
+        self.pending_question = None
+        self.touch()
 
 
 class SessionStore:
@@ -112,11 +152,23 @@ class SessionStore:
             return session.dossier
 
     def reset(self, chat_id: int) -> None:
-        """Purge one chat's state. Idempotent; never raises on unknown chats.
+        """Purge one chat's state and all its transient artifacts. Idempotent.
 
-        Used by `/start` and `/restart` (SPECS/MISSION.md, Reset criteria).
+        Used by `/start` and `/restart` (SPECS/MISSION.md, Reset criteria),
+        and by the Bouncer on rejection. Never raises on unknown chats.
+        Clears the session's temporary media *and* conversation history, logs
+        the purge, then drops the session — so operators can see temporary
+        media was disposed of and no held reference retains the user's data
+        (ROADMAP §7 acceptance: "/restart leaves no residual state or temp
+        media"). The Python process is never restarted: only this chat's
+        entry is dropped from the in-memory store.
         """
         with self._lock:
+            session = self._sessions.get(chat_id)
+            if session is None:
+                return
+            session.purge()
+            logger.info("event=temp_media_purged chat_id=%s", chat_id)
             self._sessions.pop(chat_id, None)
 
     def clear(self) -> None:

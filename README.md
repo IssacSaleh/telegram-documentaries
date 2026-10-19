@@ -34,8 +34,38 @@ present?
 
 `GEMINI_API_KEY` is required: it authorises the Bouncer's Gemini calls.
 
-Later phases (interview, converter, narration, voice) are ordered in
-[`SPECS/ROADMAP.md`](SPECS/ROADMAP.md).
+**Phase 3 — The Interviewer.** Once admitted, the bot runs a short adaptive
+interview (5–7 questions, one at a time), building a behavioural dossier
+and suggesting an animal — state is per-chat and never shared.
+
+**Phase 4 — The Converter.** When the interview finishes, the original
+photo, the dossier, and the suggested animal are fused into a hybrid animal
+portrait (Gemini image generation) and sent to the chat — no intermediate
+text hop.
+
+**Phase 5 — The Scripter.** The dossier becomes a ~60–90-word dramatic
+British-documentary narration, validated as text and sent to the chat.
+
+**Phase 6 — The Narrator.** The finished script is rendered to audio by
+Gemini TTS (not an agent — a direct client call), converted to OGG/Opus,
+and delivered as a **playable Telegram voice note** after the script text.
+A TTS or send failure degrades to a friendly reply; the session always ends
+in `DONE`.
+
+**Phase 7 — Resilience.** `/start` and `/restart` purge session state *and*
+temporary media (photo bytes and script) in any phase, without restarting the
+process, and log the purge. Stage guards answer text or a stray photo during
+the image stage with one "sit tight" nudge, leaving the run untouched. A
+transient Gemini timeout is retried with capped backoff at each model
+boundary; on exhaustion the stage degrades to a friendly reply and the
+session stays alive — no exception ever escapes into the user's flow.
+
+The full pipeline: `Bouncer → Interviewer → Converter → Scripter →
+Narrator` — send a portrait, answer the interview, and receive the hybrid
+portrait, the script text, and a playable voice note.
+
+Every phase is now delivered; see [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md) for
+the ordered plan and delivered notes.
 
 ## Contents
 
@@ -117,7 +147,7 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 112 offline tests + 3 live (skipped by default)
+./scripts/test    # 368 offline tests + 8 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
 
