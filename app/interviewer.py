@@ -66,7 +66,8 @@ CONFIRMATION_PROMPT = (
 )
 PHOTO_PROMPT = "Send me a photo of yourself first, and we'll get started."
 WRONG_PAYLOAD_PROMPT = (
-    "No photos needed right now — just answer in words, please."
+    "No photos needed right now — just answer in words, please. "
+    "If you'd rather start over, type /restart."
 )
 IMAGE_STAGE_BUSY_PROMPT = (
     "Your portrait is already in progress — sit tight while I finish it. "

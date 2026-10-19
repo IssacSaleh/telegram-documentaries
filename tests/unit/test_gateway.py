@@ -33,10 +33,12 @@ from tests.conftest import (
     ExplodingClassifier,
     ExplodingConverter,
     ExplodingPhotoFetcher,
+    ExplodingScripter,
     FakeClassifier,
     FakeConverter,
     FakeInterviewer,
     FakePhotoFetcher,
+    FakeScripter,
     FlakyPhotoFetcher,
     RecordingSender,
     human_verdict,
@@ -693,6 +695,7 @@ class TestInterviewRouting:
 
         assert reply is not None
         assert reply.text == WRONG_PAYLOAD_PROMPT
+        assert "/restart" in reply.text, "the nudge advertises the escape hatch"
         assert sender.sent == [reply]
         assert store.get(605).pending_question == "Question 1?", (
             "the open question must survive a wrong payload"
@@ -720,6 +723,7 @@ class TestInterviewRouting:
 
         assert reply is not None
         assert reply.text == WRONG_PAYLOAD_PROMPT
+        assert "/restart" in reply.text
 
     def test_text_mid_interview_without_a_wired_interviewer_degrades(self) -> None:
         from app.gateway import BouncerFallbackPolicy
@@ -879,6 +883,7 @@ class TestImageStageGuards:
 
         assert reply is not None
         assert reply.text == WRONG_PAYLOAD_PROMPT
+        assert "/restart" in reply.text, "the nudge offers the escape hatch"
         assert session.pending_question == "Question 1?", "pending question preserved"
         assert session.phase is phase
 
@@ -1308,6 +1313,121 @@ class TestConverterRouting:
         assert reply is not None, "a fetch failure must not stall the interview"
         assert store.get(chat_id).original_photo_bytes is None
         assert store.get(chat_id).phase is SessionPhase.AWAITING_CONFIRMATION
+
+
+# ---------------------------------------------------------------------------
+# Phase polish (SPECS/2026-10-20-phase-polish): a Scripter failure must not be
+# silent — the portrait is already delivered, so the user gets a friendly
+# reply instead of waiting forever for a narration that never arrives.
+# ---------------------------------------------------------------------------
+
+
+class TestScripterFailure:
+    """A raising or empty Scripter degrades with a friendly reply, lands the
+    session in DONE, logs the failure, and never raises into the caller."""
+
+    def _finish_interview(
+        self, sender: RecordingSender, chat_id: int
+    ) -> FakeInterviewer:
+        interviewer = FakeInterviewer([], animal="Red Fox")
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        for _ in range(5):
+            handle_update(
+                _update("an answer", chat_id=chat_id),
+                sender,
+                interviewer=interviewer,
+            )
+        assert get_store().get(chat_id).phase is SessionPhase.DONE
+        return interviewer
+
+    def test_scripter_failure_notifies_the_user_and_lands_done(self, caplog) -> None:
+        from app.gateway import ScripterFallbackPolicy
+
+        store = get_store()
+        sender = RecordingSender()
+        chat_id = 720
+        self._finish_interview(sender, chat_id)
+        sender.sent.clear()
+        sender.photos.clear()
+        sender.events.clear()
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries"):
+            reply = handle_update(
+                _update("go", chat_id=chat_id),
+                sender,
+                converter=FakeConverter(image_bytes=b"PORTRAIT"),
+                scripter=ExplodingScripter(),
+            )
+
+        assert reply is not None, "a failed narration must never leave silence"
+        assert reply.text == ScripterFallbackPolicy.ERROR_REPLY
+        replies = [m for m in sender.sent if m.text == ScripterFallbackPolicy.ERROR_REPLY]
+        assert len(replies) == 1, "the fallback is sent exactly once"
+        assert len(sender.photos) == 1, "the portrait is still delivered first"
+        assert sender.events == ["photo", "send"], "portrait then the fallback"
+        session = store.get(chat_id)
+        assert session.phase is SessionPhase.DONE
+        assert session.script is None, "no narration was captured"
+        assert any("event=scripter_error" in r.message for r in caplog.records)
+
+    def test_empty_script_also_degrades_with_the_same_reply(self, caplog) -> None:
+        from app.gateway import ScripterFallbackPolicy
+
+        store = get_store()
+        sender = RecordingSender()
+        chat_id = 721
+        self._finish_interview(sender, chat_id)
+        sender.sent.clear()
+        sender.photos.clear()
+        sender.events.clear()
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries"):
+            reply = handle_update(
+                _update("go", chat_id=chat_id),
+                sender,
+                converter=FakeConverter(image_bytes=b"PORTRAIT"),
+                scripter=FakeScripter(script=""),
+            )
+
+        assert reply is not None
+        assert reply.text == ScripterFallbackPolicy.ERROR_REPLY
+        replies = [m for m in sender.sent if m.text == ScripterFallbackPolicy.ERROR_REPLY]
+        assert len(replies) == 1, "the fallback is sent exactly once"
+        assert len(sender.photos) == 1, "the portrait is still delivered first"
+        assert sender.events == ["photo", "send"], "portrait then the fallback"
+        session = store.get(chat_id)
+        assert session.phase is SessionPhase.DONE
+        assert session.script is None, "no narration was captured"
+        assert any("event=scripter_empty" in r.message for r in caplog.records)
+
+    def test_scripter_not_wired_stays_silent_and_logs(self, caplog) -> None:
+        """An unwired stage only logs (like the Narrator); no new reply."""
+        sender = RecordingSender()
+        chat_id = 722
+        self._finish_interview(sender, chat_id)
+        sender.sent.clear()
+
+        with caplog.at_level(logging.INFO, logger="telegram_documentaries"):
+            reply = handle_update(
+                _update("go", chat_id=chat_id),
+                sender,
+                converter=FakeConverter(image_bytes=b"PORTRAIT"),
+                # scripter deliberately omitted -> None
+            )
+
+        assert reply is None, "an unwired Scripter adds no message"
+        assert sender.sent == []
+        assert len(sender.photos) == 1
+        assert any(
+            "event=scripter_not_wired" in r.message for r in caplog.records
+        ), "an un-logged fallback is prohibited (TECH.md)"
 
 
 class TestTelegramSenderSendPhoto:

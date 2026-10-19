@@ -139,7 +139,22 @@ explicitly; nothing advances by inferring progress from message history.
 | `DONE` | Narrator delivers the voice note | `AWAITING_PHOTO` (on `/restart`) |
 
 Any message arriving in the wrong phase is handled by the wrong-payload guard
-(ROADMAP phase 7), not by crashing or silently stalling.
+(ROADMAP phase 7), not by crashing or silently stalling. A photo / sticker /
+voice note during `AWAITING_CONFIRMATION` or `INTERVIEWING` gets a polite
+"answer in words" nudge (`WRONG_PAYLOAD_PROMPT`) that also offers `/restart`
+as an escape hatch; the pending question and phase are preserved.
+
+Every stage's **runtime failure** degrades to a friendly reply so the user is
+never left in silence: the Bouncer (`BouncerFallbackPolicy`), the Interviewer
+(`RETRY_PROMPT`), the Converter, the Scripter (`ScripterFallbackPolicy` — a
+failure *or* an empty narration; the portrait is already out, so the user is
+told the narration is not coming), and the Narrator
+(`NarratorFallbackPolicy`). A stage that is **not wired** adds no narration
+of its own: the Scripter and Narrator only log (`event=scripter_not_wired` /
+`event=narrator_not_wired`) and end the chain at `DONE`, while a not-wired
+Converter falls back to the existing portrait-pending tease (logged
+`via=portrait_pending`); the Bouncer and Interviewer, being required for any
+conversation, still send a friendly prompt when not wired.
 
 While the portrait pipeline is in flight (`GENERATING_IMAGE`, `SCRIPTING`,
 `NARRATING`) a **stage guard** answers text *or* a stray photo with a single

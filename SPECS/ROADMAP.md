@@ -137,3 +137,31 @@ the dossier.
   `test_scripter.py`, `test_narrator.py`) — all four acceptance criteria
   covered, including exhausted-timeout end-to-end through `handle_update` —
   `./scripts/hooks` clean.
+
+## 8. Polish
+
+Two small refinements raised against the delivered behaviour (spec
+`SPECS/2026-10-20-phase-polish/`):
+
+- The mid-interview wrong-payload nudge (`WRONG_PAYLOAD_PROMPT`) also offers
+  `/restart` — the command already worked in every phase; the copy now
+  advertises it as the way out.
+- A Scripter failure (or an empty narration) degrades to
+  `ScripterFallbackPolicy.ERROR_REPLY` instead of silence: the portrait is
+  already out, so the user is told the narration is not coming, with
+  `event=scripter_error` / `event=scripter_empty` logged and the session
+  landing in `DONE`. The "not wired" branch stays log-only
+  (`event=scripter_not_wired`), matching the Narrator.
+
+- **Acceptance:** a photo/sticker/voice during `AWAITING_CONFIRMATION` or
+  `INTERVIEWING` nudges *and* mentions `/restart`, with the pending question
+  and phase preserved; a raising or empty Scripter never leaves the user in
+  silence and never raises into `handle_update`; the happy path and every
+  other stage's copy are unchanged.
+- **Serves:** error-policy contract; graceful out-of-order handling.
+- **Delivered:** `WRONG_PAYLOAD_PROMPT` extended in `app/interviewer.py`;
+  `ScripterFallbackPolicy` added and sent from both Scripter failure branches
+  in `app/gateway.py`. Verified by the offline suite
+  (`tests/unit/test_gateway.py::TestScripterFailure`, the wrong-payload nudge
+  tests, `tests/unit/test_interviewer.py`) — `./scripts/test` green (372
+  passed, 8 skipped), `./scripts/hooks` clean.
