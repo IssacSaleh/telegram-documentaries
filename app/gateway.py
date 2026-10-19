@@ -29,9 +29,9 @@ SPECS/2026-10-17-converter):
   * **other**  -> mid-interview, a gentle "answer in words"; otherwise logged
     and ignored.
 
-Any failure (fetch, classification, conversion, script, TTS, ADK not wired)
-degrades to a friendly reply — the user is never left in silence
-(SPECS/TECH.md error policy).
+Any failure (fetch, classification, conversion, script, TTS) degrades to a
+friendly reply — the user is never left in silence (SPECS/TECH.md error
+policy). A stage that is not wired is logged and ends the chain cleanly.
 """
 
 from __future__ import annotations
@@ -105,6 +105,21 @@ class NarratorFallbackPolicy:
     ERROR_REPLY = (
         "The voice note didn't make it out this time — the narration above "
         "is still yours to enjoy. Better luck next run!"
+    )
+
+
+class ScripterFallbackPolicy:
+    """Friendly reply when the narration could not be written.
+
+    The portrait has already reached the chat, so a Scripter failure (or an
+    empty script) degrades to this reply instead of silence — the user is
+    told the narration is not coming and the session lands in DONE
+    (SPECS/TECH.md error policy; SPECS/2026-10-20-phase-polish decision P2).
+    """
+
+    ERROR_REPLY = (
+        "The narration didn't come together this time — but your portrait "
+        "above is all yours. Better luck next run!"
     )
 
 
@@ -183,8 +198,9 @@ def _run_converter(
     On success the portrait goes straight to Telegram, the Scripter's
     narration follows it as plain text (decision D2: the text message stays),
     and the Narrator's verified OGG/Opus voice note follows that — portrait
-    -> script text -> voice note, one stage per try/except, no extra user
-    message anywhere.
+    -> script text -> voice note, one stage per try/except. Any failure in
+    that chain degrades to a friendly reply (SPECS/TECH.md error policy); a
+    stage that is not wired only logs and ends the chain at DONE.
 
     Phase transitions per SPECS/TECH.md (decision D6): GENERATING_IMAGE when
     the fusion starts, SCRIPTING once the portrait is out, NARRATING once
@@ -244,33 +260,44 @@ def _run_converter(
         if scripter is None:
             # Not wired: no narration to write, so nothing to narrate —
             # the chain ends cleanly at DONE instead of idling in SCRIPTING.
+            logger.warning("event=scripter_not_wired chat_id=%s", chat_id)
             session.phase = SessionPhase.DONE
             return None
         try:
             script = scripter.generate_script(dossier)
-            if script:
-                # Capture the raw narration on the session so it is
-                # available to the Narrator (Phase 6) for audio synthesis.
-                session.script = script
-                session.touch()
-                logger.info(
-                    "event=script_captured chat_id=%s chars=%d words=%d "
-                    "session_script_stored=%s",
-                    chat_id,
-                    len(script),
-                    len(script.split()),
-                    session.script is not None,
-                )
-                if sender is not None:
-                    sender.send(OutboundMessage(chat_id=chat_id, text=script))
-                logger.info("event=script_sent chat_id=%s", chat_id)
-            else:
-                session.phase = SessionPhase.DONE
-                return None
         except Exception:
             session.phase = SessionPhase.DONE
             logger.exception("event=scripter_error chat_id=%s", chat_id)
-            return None
+            return _send(
+                chat_id,
+                ScripterFallbackPolicy.ERROR_REPLY,
+                sender,
+                event="scripter_error",
+            )
+        if not script:
+            session.phase = SessionPhase.DONE
+            logger.error("event=scripter_empty chat_id=%s", chat_id)
+            return _send(
+                chat_id,
+                ScripterFallbackPolicy.ERROR_REPLY,
+                sender,
+                event="scripter_empty",
+            )
+        # Capture the raw narration on the session so it is available to the
+        # Narrator (Phase 6) for audio synthesis, then deliver it as text.
+        session.script = script
+        session.touch()
+        logger.info(
+            "event=script_captured chat_id=%s chars=%d words=%d "
+            "session_script_stored=%s",
+            chat_id,
+            len(script),
+            len(script.split()),
+            session.script is not None,
+        )
+        if sender is not None:
+            sender.send(OutboundMessage(chat_id=chat_id, text=script))
+        logger.info("event=script_sent chat_id=%s", chat_id)
         # Script delivered as text: the Narrator is next.
         session.phase = SessionPhase.NARRATING
         return _deliver_voice_note(chat_id, session, sender, narrator, script)
@@ -346,9 +373,12 @@ def handle_update(
     scripter: Scripter | None = None,
     narrator: Narrator | None = None,
 ) -> OutboundMessage | None:
-    """Turn one validated update into at most one outbound reply.
+    """Route one validated update through the phase-aware pipeline.
 
-    Routing is phase-aware (SPECS/2026-10-16-interviewer, 2026-10-17-converter):
+    Most updates produce a single reply, but a closing interview answer can
+    drive the whole tail chain (interview reply + portrait + script text +
+    voice note) in one pass. Routing is phase-aware
+    (SPECS/2026-10-16-interviewer, 2026-10-17-converter):
 
       * **reset commands** (`/start`, `/restart`) purge the chat in *any*
         phase and then point the user at the photo flow.

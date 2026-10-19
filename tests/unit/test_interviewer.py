@@ -300,6 +300,12 @@ class TestCompletionAndGuards:
         assert store.get(85).pending_question == pending
         assert store.get(85).phase is SessionPhase.INTERVIEWING
 
+    def test_wrong_payload_prompt_asks_for_text_and_offers_restart(self) -> None:
+        """The nudge keeps asking for a text answer and advertises the
+        `/restart` escape hatch (SPECS/2026-10-20-phase-polish)."""
+        assert "words" in _strip(WRONG_PAYLOAD_PROMPT)
+        assert "/restart" in WRONG_PAYLOAD_PROMPT
+
     def test_handle_portrait_pending_sends_tease(self) -> None:
         decision = handle_portrait_pending(86)
         assert decision.reply.chat_id == 86

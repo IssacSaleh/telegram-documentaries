@@ -60,6 +60,11 @@ transient Gemini timeout is retried with capped backoff at each model
 boundary; on exhaustion the stage degrades to a friendly reply and the
 session stays alive — no exception ever escapes into the user's flow.
 
+**Phase 8 — Polish.** Two small refinements: the mid-interview out-of-order
+nudge now also offers `/restart` as an escape hatch, and a Scripter failure
+(or empty narration) degrades to a friendly reply instead of silence — the
+portrait is already out, so the user is told the narration is not coming.
+
 The full pipeline: `Bouncer → Interviewer → Converter → Scripter →
 Narrator` — send a portrait, answer the interview, and receive the hybrid
 portrait, the script text, and a playable voice note.
@@ -147,7 +152,7 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 368 offline tests + 8 live (skipped by default)
+./scripts/test    # 372 offline tests + 8 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
 

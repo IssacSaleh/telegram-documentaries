@@ -341,6 +341,17 @@ class FakeScripter:
         return self.script
 
 
+class ExplodingScripter:
+    """Scripter double that models a Gemini narration failure."""
+
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    def generate_script(self, dossier) -> str:
+        self.calls.append(dossier)
+        raise RuntimeError("gemini script 500")
+
+
 class FakeNarrator:
     """Narrator double: records the scripts it is asked to render.
 
