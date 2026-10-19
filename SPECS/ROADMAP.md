@@ -113,3 +113,25 @@ the dossier.
   timeout never raises into the user's flow.
 - **Serves:** `/restart` reset criterion; graceful out-of-order handling;
   error-policy contract.
+- **Delivered:** a shared retry helper, `app/resilience.py` —
+  `RetryPolicy` (frozen; `max_attempts=3`, `base_delay=0.5`, `factor=2.0`,
+  `max_delay=4.0`), name/status-based `is_transient_error`, and
+  `call_with_retries(...)` (injectable sleeper; logs `event=gemini_retry` per
+  retry and `event=gemini_retry_exhausted` on give-up, error *type* only). It
+  wraps the single Gemini call inside all five boundaries — Bouncer
+  `classify`, Interviewer `next_turn`/`final_turn`, Converter `generate`,
+  Scripter `generate_script`, Narrator `synthesise` — never in the gateway,
+  whose existing per-stage degrade paths turn an exhausted retry into a
+  friendly reply. `Session.clear_media()` + `SessionStore.reset()` purge the
+  session's photo bytes/mime/file_id and script and log
+  `event=temp_media_purged` before dropping the session. Stage guards
+  (`IMAGE_STAGE_PHASES`, `handle_wrong_stage`, `IMAGE_STAGE_BUSY_PROMPT`)
+  answer text *and* a stray photo during `GENERATING_IMAGE`/`SCRIPTING`/
+  `NARRATING` with one "sit tight" nudge, mutating no state and never
+  re-gating the photo through the Bouncer; `/start` and `/restart` still take
+  precedence in any phase. Verified by the offline suite
+  (`tests/unit/test_resilience.py`, `test_state.py`, `test_gateway.py`,
+  `test_bouncer.py`, `test_interviewer.py`, `test_converter.py`,
+  `test_scripter.py`, `test_narrator.py`) — all four acceptance criteria
+  covered, including exhausted-timeout end-to-end through `handle_update` —
+  `./scripts/hooks` clean.

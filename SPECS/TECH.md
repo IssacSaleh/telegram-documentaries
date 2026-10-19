@@ -85,6 +85,18 @@ degrades to a friendly reply and lands the session in `DONE`.
   gracefully** so the conversation continues. Retry with backoff first; if it
   still fails, send a friendly message and keep the session alive. **Never raise
   into the user's flow.**
+- The retry policy is one shared helper, `app/resilience.py`
+  (`call_with_retries`, frozen `RetryPolicy`): at most `max_attempts=3` calls
+  with capped exponential backoff (`min(base_delay * factor**n, max_delay)`,
+  `0.5s → 1.0s`, cap `4.0s`). Only **transient** errors are retried —
+  name/status-based (`timeout`/`deadline`, `httpx` timeouts, HTTP
+  `429/500/502/503/504`); deterministic errors re-raise immediately. On
+  exhaustion the last error is re-raised **unchanged** for the caller's stage
+  fallback. It is applied *inside* the five concrete Gemini adapters (Bouncer,
+  Interviewer, Converter, Scripter, Narrator) — never in the gateway. The
+  sleeper is injectable so tests never sleep; logs carry the error *type* only
+  (`event=gemini_retry`, `event=gemini_retry_exhausted`) — never free-form
+  exception text, which could embed a secret.
 - Prohibited: bare `except: pass`, swallowed exceptions, un-logged fallbacks.
 
 ## Secret-safe transport
@@ -103,7 +115,11 @@ and report HTTP status plus Telegram's `description` instead.
 - Versioned, per-`chat_id` schema. Never share state across chat IDs.
 - **One shared state driver** — stages do not each invent their own storage.
 - `/start` and `/restart` purge session state and temporary media, without
-  restarting the process.
+  restarting the process. `/start` and `/restart` take precedence in *any*
+  phase. The purge is explicit: `Session.clear_media()` drops the session's
+  photo bytes/mime/file_id and script, `SessionStore.reset()` logs
+  `event=temp_media_purged`, then the session is dropped. There are **no
+  on-disk temp files**; the in-memory session is their only owner.
 
 ### State machine phases
 
@@ -121,6 +137,13 @@ explicitly; nothing advances by inferring progress from message history.
 
 Any message arriving in the wrong phase is handled by the wrong-payload guard
 (ROADMAP phase 7), not by crashing or silently stalling.
+
+While the portrait pipeline is in flight (`GENERATING_IMAGE`, `SCRIPTING`,
+`NARRATING`) a **stage guard** answers text *or* a stray photo with a single
+"sit tight" nudge (`IMAGE_STAGE_BUSY_PROMPT`), mutating no session state and
+never re-gating the photo through the Bouncer (which would clobber the run).
+`IMAGE_STAGE_PHASES` / `handle_wrong_stage` own this; it is checked in
+`handle_update` after the reset commands, so `/start` and `/restart` still win.
 
 ## Testing
 

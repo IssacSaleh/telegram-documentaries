@@ -45,6 +45,7 @@ from app.bouncer import BOUNCER_MODEL, bounce
 from app.config import TELEGRAM_API, telegram_payload
 from app.converter import CONVERTER_MODEL, Converter, GenAiConverter
 from app.interviewer import (
+    IMAGE_STAGE_PHASES,
     INTERVIEWER_MODEL,
     PHOTO_PROMPT,
     AdkInterviewer,
@@ -53,6 +54,7 @@ from app.interviewer import (
     handle_photo_admitted,
     handle_portrait_pending,
     handle_wrong_payload,
+    handle_wrong_stage,
 )
 from app.logging_utils import get_logger, logged
 from app.models import Dossier, OutboundMessage, OutboundPhoto, TelegramUpdate
@@ -350,6 +352,9 @@ def handle_update(
 
       * **reset commands** (`/start`, `/restart`) purge the chat in *any*
         phase and then point the user at the photo flow.
+      * **image stage in flight** (GENERATING_IMAGE / SCRIPTING /
+        NARRATING): text *and* photo get the single "sit tight" nudge;
+        the Bouncer is never consulted and no state is touched (ROADMAP §7).
       * **photo**  -> the Bouncer (Phase 2) gates it. Rejection is sent and
         the chat's ephemeral state is purged; an admission invites an
         interview and stores the original photo for the Converter. A Bouncer
@@ -384,6 +389,18 @@ def handle_update(
 
     session = store.get(chat_id)
     answering = session is not None and session.phase in _ANSWER_PHASES
+
+    # ---- Stage guard: the portrait pipeline is in flight ----------------
+    # R2 (ROADMAP §7): text OR a photo arriving during GENERATING_IMAGE /
+    # SCRIPTING / NARRATING gets the single "sit tight" nudge and touches
+    # no state — checked BEFORE the Bouncer path so a stray photo is never
+    # re-gated as a fresh submission (it would clobber the in-flight run).
+    if session is not None and session.phase in IMAGE_STAGE_PHASES:
+        decision = handle_wrong_stage(chat_id)
+        if sender is not None:
+            sender.send(decision.reply)
+        logger.info("event=replied chat_id=%s via=wrong_stage", chat_id)
+        return decision.reply
 
     # ---- Photo -> Bouncer, unless an interview is in progress ----------
     if message.largest_photo() is not None:

@@ -180,6 +180,21 @@ class FlakyPhotoFetcher:
         return self.data, self.mime
 
 
+class RecordingSleeper:
+    """RetryPolicy sleeper double: records every delay, never really sleeps.
+
+    The retry helper (ROADMAP §7) takes an injectable sleeper so the suite
+    is instant and deterministic; this double records the backoff schedule
+    a test wants to assert on.
+    """
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.delays.append(seconds)
+
+
 class FakeClassifier:
     """HumanPresenceClassifier double: returns a canned verdict."""
 

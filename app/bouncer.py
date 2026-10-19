@@ -18,6 +18,8 @@ Text/image classification only — no TTS, no video (SPECS/MISSION.md).
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -27,6 +29,7 @@ from app.adk_utils import extract_json
 from app.config import TELEGRAM_API, telegram_payload
 from app.logging_utils import get_logger, logged
 from app.models import BouncerVerdict, OutboundMessage, TelegramUpdate
+from app.resilience import call_with_retries
 from app.state import get_store
 
 logger = get_logger("bouncer")
@@ -156,13 +159,16 @@ class AdkHumanPresenceClassifier:
 
     ADK builds the multimodal request; we validate its structured output
     into `BouncerVerdict` before it crosses the boundary (TECH rule).
+    A transient Gemini timeout is retried with capped backoff
+    (ROADMAP §7); exhaustion re-raises for `bounce()`'s degrade path.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, sleeper: Callable[[float], None] = time.sleep) -> None:
         # Imported lazily so unit tests never pay the ADK import cost and
         # never accidentally make a network call.
         from google.adk.agents import LlmAgent
 
+        self._sleeper = sleeper
         self._agent = LlmAgent(
             name="bouncer",
             model=BOUNCER_MODEL,
@@ -181,7 +187,10 @@ class AdkHumanPresenceClassifier:
         """
         import asyncio
 
-        return asyncio.run(self._classify_async(image_bytes, mime_type))
+        return call_with_retries(
+            lambda: asyncio.run(self._classify_async(image_bytes, mime_type)),
+            sleeper=self._sleeper,
+        )
 
     async def _classify_async(self, image_bytes: bytes, mime_type: str) -> BouncerVerdict:
         import uuid

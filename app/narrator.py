@@ -21,11 +21,14 @@ contracts:
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
 from app.logging_utils import get_logger
+from app.resilience import call_with_retries
 
 logger = get_logger("narrator")
 
@@ -215,20 +218,26 @@ class GeminiTtsNarrator:
     the module boundary); production wiring constructs the real client.
     """
 
-    def __init__(self, client: Any = None) -> None:
+    def __init__(
+        self, client: Any = None, *, sleeper: Callable[[float], None] = time.sleep
+    ) -> None:
         if client is None:
             from google import genai
 
             client = genai.Client()
         self._client = client
+        self._sleeper = sleeper
 
     def synthesise(self, script: str) -> bytes:
         """Render ``script`` to verified OGG/Opus bytes, or raise typed.
 
         All-or-nothing (decision D5): either bytes that pass
         ``verify_ogg_opus``, or a ``NarrationError`` — never partial output.
-        Failures are logged loudly here and re-raised for the gateway to
-        degrade gracefully with a friendly reply (SPECS/TECH.md error policy).
+        A transient Gemini TTS timeout is retried with capped backoff
+        (ROADMAP §7) *at the client-call boundary*, so the timeout is
+        retryable before it is wrapped into the typed error. Failures are
+        logged loudly here and re-raised for the gateway to degrade
+        gracefully with a friendly reply (SPECS/TECH.md error policy).
         """
         if not script or not script.strip():
             raise NarrationError("refusing to synthesise an empty script")
@@ -238,19 +247,22 @@ class GeminiTtsNarrator:
         try:
             from google.genai import types
 
-            response = self._client.models.generate_content(
-                model=NARRATOR_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=NARRATOR_VOICE
+            response = call_with_retries(
+                lambda: self._client.models.generate_content(
+                    model=NARRATOR_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=NARRATOR_VOICE
+                                )
                             )
-                        )
+                        ),
                     ),
                 ),
+                sleeper=self._sleeper,
             )
 
             pcm = parse_tts_response(response)

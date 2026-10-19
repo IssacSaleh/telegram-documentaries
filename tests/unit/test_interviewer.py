@@ -10,6 +10,8 @@ from pydantic import ValidationError
 from app.interviewer import (
     COMPLETION_TEMPLATE,
     CONFIRMATION_PROMPT,
+    IMAGE_STAGE_BUSY_PROMPT,
+    IMAGE_STAGE_PHASES,
     INTERVIEWER_INSTRUCTION,
     INTERVIEWER_MODEL,
     PORTRAIT_PENDING_REPLY,
@@ -21,12 +23,14 @@ from app.interviewer import (
     handle_photo_admitted,
     handle_portrait_pending,
     handle_wrong_payload,
+    handle_wrong_stage,
 )
-from app.models import DossierAnswer, InterviewTurn, OutboundMessage
+from app.models import Dossier, DossierAnswer, InterviewTurn, OutboundMessage
 from app.state import SessionPhase, get_store
 from tests.conftest import (
     ExplodingInterviewer,
     FakeInterviewer,
+    RecordingSleeper,
 )
 
 
@@ -308,6 +312,132 @@ class TestCompletionAndGuards:
         assert decision.reply.text == RETRY_PROMPT
         assert decision.error is True
         assert any("event=interviewer_error" in r.message for r in caplog.records)
+
+
+class TestAdkInterviewerRetries:
+    """ROADMAP §7: transient Gemini timeouts in the concrete adapter are
+    retried with backoff; exhaustion re-raises for the RETRY_PROMPT path."""
+
+    def _interviewer_with_timeout_then_turn(self, monkeypatch, turn: InterviewTurn):
+        sleeper = RecordingSleeper()
+        interviewer = AdkInterviewer(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def flaky_run(self, prompt: str) -> InterviewTurn:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise TimeoutError("gemini timed out")
+            return turn
+
+        monkeypatch.setattr(AdkInterviewer, "_run", flaky_run)
+        return interviewer, sleeper, attempts
+
+    def test_next_turn_retries_a_transient_timeout_then_returns_the_turn(
+        self, monkeypatch
+    ) -> None:
+        interviewer, sleeper, attempts = self._interviewer_with_timeout_then_turn(
+            monkeypatch, InterviewTurn(next_question="Q1?")
+        )
+
+        result = interviewer.next_turn(Dossier())
+
+        assert result.next_question == "Q1?"
+        assert attempts["n"] == 2
+        assert sleeper.delays == [0.5]
+
+    def test_final_turn_retries_a_transient_timeout_then_returns_the_turn(
+        self, monkeypatch
+    ) -> None:
+        interviewer, sleeper, attempts = self._interviewer_with_timeout_then_turn(
+            monkeypatch,
+            InterviewTurn(is_complete=True, suggested_animal="Red Fox"),
+        )
+
+        result = interviewer.final_turn(Dossier(asked=7))
+
+        assert result.suggested_animal == "Red Fox"
+        assert attempts["n"] == 2
+        assert sleeper.delays == [0.5]
+
+    def test_a_first_try_success_is_untouched(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        interviewer = AdkInterviewer(sleeper=sleeper)
+
+        async def instant(self, prompt: str) -> InterviewTurn:
+            return InterviewTurn(next_question="Q1?")
+
+        monkeypatch.setattr(AdkInterviewer, "_run", instant)
+
+        assert interviewer.next_turn(Dossier()).next_question == "Q1?"
+        assert sleeper.delays == []
+
+    def test_exhaustion_reraises_the_timeout_unchanged(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        interviewer = AdkInterviewer(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def always_times_out(self, prompt: str) -> InterviewTurn:
+            attempts["n"] += 1
+            raise TimeoutError("gemini timed out")
+
+        monkeypatch.setattr(AdkInterviewer, "_run", always_times_out)
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            interviewer.next_turn(Dossier())
+
+        assert attempts["n"] == 3, "bounded: at most max_attempts calls"
+
+    def test_a_deterministic_error_is_not_retried(self, monkeypatch) -> None:
+        sleeper = RecordingSleeper()
+        interviewer = AdkInterviewer(sleeper=sleeper)
+        attempts = {"n": 0}
+
+        async def invalid(self, prompt: str) -> InterviewTurn:
+            attempts["n"] += 1
+            raise ValueError("validation failed")
+
+        monkeypatch.setattr(AdkInterviewer, "_run", invalid)
+
+        with pytest.raises(ValueError, match="validation failed"):
+            interviewer.next_turn(Dossier())
+
+        assert attempts["n"] == 1
+        assert sleeper.delays == []
+
+
+class TestHandleWrongStage:
+    """ROADMAP §7 stage guard: out-of-order input during the image stage."""
+
+    def test_image_stage_phases_are_the_three_generation_phases(self) -> None:
+        assert set(IMAGE_STAGE_PHASES) == {
+            SessionPhase.GENERATING_IMAGE,
+            SessionPhase.SCRIPTING,
+            SessionPhase.NARRATING,
+        }
+
+    def test_wrong_stage_reply_is_a_single_named_constant(self) -> None:
+        """One named reply constant — greppable, testable, no copy drift."""
+        decision = handle_wrong_stage(90)
+        assert decision.reply.text == IMAGE_STAGE_BUSY_PROMPT
+        assert decision.reply.chat_id == 90
+        assert decision.error is False
+
+    def test_wrong_stage_is_a_sit_tight_nudge(self) -> None:
+        prompt = IMAGE_STAGE_BUSY_PROMPT.lower()
+        assert "sit tight" in prompt or "in progress" in prompt
+
+    def test_handle_wrong_stage_mutates_no_session_state(self) -> None:
+        store = get_store()
+        session = store.get_or_create(91)
+        session.phase = SessionPhase.GENERATING_IMAGE
+        session.pending_question = "What is your quest?"
+        before_updated = session.updated_at
+
+        handle_wrong_stage(91)
+
+        assert session.phase is SessionPhase.GENERATING_IMAGE
+        assert session.pending_question == "What is your quest?"
+        assert session.updated_at == before_updated, "no touch, no mutation"
 
 
 class TestAdkInterviewerPromptFormatting:

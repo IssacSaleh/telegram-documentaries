@@ -38,6 +38,7 @@ from app.narrator import (
     pcm_to_ogg_opus,
     verify_ogg_opus,
 )
+from tests.conftest import RecordingSleeper
 
 
 def _ogg_page(body: bytes) -> bytes:
@@ -449,4 +450,93 @@ class TestGeminiTtsNarratorFailures:
 
         with pytest.raises(NarrationError):
             narrator.synthesise("A script about a fox.")
+
+
+class _FlakyTtsClient:
+    """Fake TTS client: times out once, then returns a valid audio response."""
+
+    def __init__(self, response: object) -> None:
+        self.calls: list[dict] = []
+        self.models = self
+        self._response = response
+
+    def generate_content(self, **kwargs) -> object:
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise TimeoutError("gemini tts timed out")
+        return self._response
+
+
+class _AlwaysTimingOutTtsClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.models = self
+
+    def generate_content(self, **kwargs) -> object:
+        self.calls.append(kwargs)
+        raise TimeoutError("gemini tts timed out")
+
+
+class TestGeminiTtsNarratorRetries:
+    """ROADMAP §7: a transient Gemini TTS timeout is retried with backoff;
+    exhaustion surfaces as the existing typed NarrationError for the
+    gateway's narrator fallback — never an unhandled exception."""
+
+    def test_transient_timeout_is_retried_then_verified_ogg_returns(self) -> None:
+        sleeper = RecordingSleeper()
+        client = _FlakyTtsClient(
+            _FakeTtsResponse.one_part(_fake_pcm(), VALID_MIME)
+        )
+        narrator = GeminiTtsNarrator(client=client, sleeper=sleeper)
+
+        ogg = narrator.synthesise("In the quiet hours, a fox-like soul stirs.")
+
+        verify_ogg_opus(ogg)  # same verified-bytes contract as a first-try success
+        assert len(client.calls) == 2, "one retry after the timeout"
+        assert sleeper.delays == [0.5]
+
+    def test_a_first_try_success_sleeps_nothing(self) -> None:
+        sleeper = RecordingSleeper()
+        client = FakeGenAiTtsClient(
+            response=_FakeTtsResponse.one_part(_fake_pcm(), VALID_MIME)
+        )
+        narrator = GeminiTtsNarrator(client=client, sleeper=sleeper)
+
+        ogg = narrator.synthesise("In the quiet hours, a fox-like soul stirs.")
+
+        assert ogg[:4] == b"OggS"
+        assert sleeper.delays == []
+
+    def test_exhaustion_raises_a_typed_error_carrying_the_timeout(self) -> None:
+        sleeper = RecordingSleeper()
+        client = _AlwaysTimingOutTtsClient()
+        narrator = GeminiTtsNarrator(client=client, sleeper=sleeper)
+
+        with pytest.raises(NarrationError) as exc_info:
+            narrator.synthesise("A script about a fox.")
+
+        assert isinstance(exc_info.value.__cause__, TimeoutError), (
+            "the underlying timeout must survive for the logs and the fallback"
+        )
+        assert len(client.calls) == 3, "bounded: at most max_attempts calls"
+
+    def test_a_deterministic_error_is_not_retried(self) -> None:
+        sleeper = RecordingSleeper()
+        attempts = {"n": 0}
+
+        class _Client:
+            def __init__(self) -> None:
+                self.models = self
+
+            def generate_content(self, **kwargs) -> object:
+                attempts["n"] += 1
+                raise ValueError("bad request")
+
+        narrator = GeminiTtsNarrator(client=_Client(), sleeper=sleeper)
+
+        with pytest.raises(NarrationError):
+            narrator.synthesise("A script about a fox.")
+
+        assert attempts["n"] == 1
+        assert sleeper.delays == []
 

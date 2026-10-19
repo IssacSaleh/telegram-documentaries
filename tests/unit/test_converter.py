@@ -18,6 +18,7 @@ from app.converter import (
     dossier_to_summary,
 )
 from app.models import Dossier, DossierAnswer
+from tests.conftest import RecordingSleeper
 
 
 class TestConverterConstants:
@@ -225,3 +226,109 @@ class TestGenAiConverter:
                 dossier_text="d",
                 suggested_animal="Red Fox",
             )
+
+
+class _FlakyImageClient:
+    """Fake genai client: times out once, then returns a real image response."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.models = self
+
+    def generate_content(self, **kwargs) -> object:
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise TimeoutError("gemini image timed out")
+        return _FakeResponse(
+            [_FakeCandidate([_FakePart(_FakeInlineData(b"PORTRAIT", "image/png"))])]
+        )
+
+
+class _AlwaysTimingOutClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.models = self
+
+    def generate_content(self, **kwargs) -> object:
+        self.calls.append(kwargs)
+        raise TimeoutError("gemini image timed out")
+
+
+class TestGenAiConverterRetries:
+    """ROADMAP §7: a transient Gemini timeout in `generate` is retried with
+    backoff; exhaustion re-raises for the gateway's degrade path."""
+
+    def _converter(self, client, sleeper):
+        from app.converter import GenAiConverter
+
+        converter = GenAiConverter.__new__(GenAiConverter)
+        converter._client = client
+        converter._sleeper = sleeper
+        return converter
+
+    @staticmethod
+    def _generate(converter) -> object:
+        return converter.generate(
+            original_photo_bytes=b"PHOTO",
+            original_photo_mime="image/jpeg",
+            dossier_text="Q: hi\nA: there",
+            suggested_animal="Red Fox",
+        )
+
+    def test_transient_timeout_is_retried_then_the_portrait_returns(self) -> None:
+        sleeper = RecordingSleeper()
+        client = _FlakyImageClient()
+        converter = self._converter(client, sleeper)
+
+        result = self._generate(converter)
+
+        assert result.image_bytes == b"PORTRAIT"
+        assert len(client.calls) == 2, "one retry after the timeout"
+        assert sleeper.delays == [0.5]
+
+    def test_a_first_try_success_sleeps_nothing(self) -> None:
+        sleeper = RecordingSleeper()
+
+        class _Client:
+            def __init__(self) -> None:
+                self.models = self
+
+            def generate_content(self, **kwargs):
+                return _FakeResponse(
+                    [_FakeCandidate([_FakePart(_FakeInlineData(b"IMG", "image/png"))])]
+                )
+
+        converter = self._converter(_Client(), sleeper)
+
+        assert self._generate(converter).image_bytes == b"IMG"
+        assert sleeper.delays == []
+
+    def test_exhaustion_reraises_the_timeout_unchanged(self) -> None:
+        sleeper = RecordingSleeper()
+        client = _AlwaysTimingOutClient()
+        converter = self._converter(client, sleeper)
+
+        with pytest.raises(TimeoutError, match="timed out"):
+            self._generate(converter)
+
+        assert len(client.calls) == 3, "bounded: at most max_attempts calls"
+
+    def test_a_deterministic_error_is_not_retried(self) -> None:
+        sleeper = RecordingSleeper()
+        attempts = {"n": 0}
+
+        class _Client:
+            def __init__(self) -> None:
+                self.models = self
+
+            def generate_content(self, **kwargs):
+                attempts["n"] += 1
+                raise ValueError("bad request")
+
+        converter = self._converter(_Client(), sleeper)
+
+        with pytest.raises(ValueError, match="bad request"):
+            self._generate(converter)
+
+        assert attempts["n"] == 1
+        assert sleeper.delays == []

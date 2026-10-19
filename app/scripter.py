@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.logging_utils import get_logger
+from app.resilience import call_with_retries
 
 if TYPE_CHECKING:
     from app.models import Dossier
@@ -46,12 +49,16 @@ def dossier_to_personality_summary(dossier: Dossier) -> str:
 
 
 class AdkScripter:
-    def __init__(self) -> None:
+    """ADK-wired Scripter. A transient Gemini timeout is retried with capped
+    backoff (ROADMAP §7); exhaustion re-raises for the gateway's degrade."""
+
+    def __init__(self, *, sleeper: Callable[[float], None] = time.sleep) -> None:
         try:
             from google.adk.agents import LlmAgent
         except Exception as exc:
             raise RuntimeError("google.adk not available") from exc
 
+        self._sleeper = sleeper
         self._agent = LlmAgent(
             name="scripter",
             model=SCRIPTER_MODEL,
@@ -60,39 +67,47 @@ class AdkScripter:
         )
 
     def generate_script(self, dossier: Dossier) -> str:
-        import asyncio
+        def _generate() -> str:
+            import asyncio
 
-        from app.adk_utils import extract_json
+            from app.adk_utils import extract_json
 
-        summary = dossier_to_personality_summary(dossier)
-        prompt = f"Personality summary:\n\n{summary}\n\nGenerate the documentary narration."
-
-        async def _run() -> str:
-            from google.adk.runners import InMemoryRunner
-            from google.genai import types
-
-            runner = InMemoryRunner(agent=self._agent)
-            session = await runner.session_service.create_session(
-                app_name=runner.app_name, user_id="scripter"
+            summary = dossier_to_personality_summary(dossier)
+            prompt = (
+                f"Personality summary:\n\n{summary}\n\n"
+                "Generate the documentary narration."
             )
-            raw = None
-            async for event in runner.run_async(
-                user_id="scripter",
-                session_id=session.id,
-                new_message=types.Content(
-                    role="user", parts=[types.Part.from_text(text=prompt)]
-                ),
-            ):
-                if event.is_final_response() and event.content is not None:
-                    raw = event.content.parts[0].text if event.content.parts else ""
-                    break
-            if not raw:
-                raise RuntimeError("scripter returned no content")
-            script = Script.model_validate_json(extract_json(raw))
-            return script.text
 
-        try:
-            return asyncio.run(_run())
-        except Exception:
-            logger.exception("event=scripter_error")
-            raise
+            async def _run() -> str:
+                from google.adk.runners import InMemoryRunner
+                from google.genai import types
+
+                runner = InMemoryRunner(agent=self._agent)
+                session = await runner.session_service.create_session(
+                    app_name=runner.app_name, user_id="scripter"
+                )
+                raw = None
+                async for event in runner.run_async(
+                    user_id="scripter",
+                    session_id=session.id,
+                    new_message=types.Content(
+                        role="user", parts=[types.Part.from_text(text=prompt)]
+                    ),
+                ):
+                    if event.is_final_response() and event.content is not None:
+                        raw = (
+                            event.content.parts[0].text if event.content.parts else ""
+                        )
+                        break
+                if not raw:
+                    raise RuntimeError("scripter returned no content")
+                script = Script.model_validate_json(extract_json(raw))
+                return script.text
+
+            try:
+                return asyncio.run(_run())
+            except Exception:
+                logger.exception("event=scripter_error")
+                raise
+
+        return call_with_retries(_generate, sleeper=self._sleeper)

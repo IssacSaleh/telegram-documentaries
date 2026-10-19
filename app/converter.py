@@ -13,11 +13,14 @@ turns into a friendly reply (SPECS/TECH.md error policy).
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.logging_utils import get_logger
+from app.resilience import call_with_retries
 
 if TYPE_CHECKING:
     from app.models import Dossier
@@ -87,11 +90,20 @@ def dossier_to_summary(dossier: Dossier) -> str:
 
 
 class GenAiConverter:
-    """Concrete Converter backed by the google-genai SDK."""
+    """Concrete Converter backed by the google-genai SDK.
 
-    def __init__(self) -> None:
+    A transient Gemini timeout is retried with capped backoff (ROADMAP §7);
+    exhaustion re-raises for the gateway's portrait fallback.
+    """
+
+    #: Class-level default so instances built via ``__new__`` (tests that
+    #: bypass the genai-client construction) still resolve a sleeper.
+    _sleeper: Callable[[float], None] = time.sleep
+
+    def __init__(self, *, sleeper: Callable[[float], None] = time.sleep) -> None:
         from google import genai
 
+        self._sleeper = sleeper
         self._client = genai.Client()
 
     def generate(
@@ -104,44 +116,47 @@ class GenAiConverter:
     ) -> ConverterResult:
         from google.genai import types
 
-        prompt = _CONVERTER_PROMPT.format(
-            animal=suggested_animal, dossier=dossier_text
-        )
-
-        # All three inputs go out together in one multimodal call.
-        contents = [
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_bytes(
-                        data=original_photo_bytes, mime_type=original_photo_mime
-                    ),
-                    types.Part.from_text(text=prompt),
-                ],
+        def _generate() -> ConverterResult:
+            prompt = _CONVERTER_PROMPT.format(
+                animal=suggested_animal, dossier=dossier_text
             )
-        ]
 
-        logger.info(
-            "event=converter_request model=%s animal=%s photo_bytes=%d",
-            CONVERTER_MODEL,
-            suggested_animal,
-            len(original_photo_bytes),
-        )
+            # All three inputs go out together in one multimodal call.
+            contents = [
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_bytes(
+                            data=original_photo_bytes, mime_type=original_photo_mime
+                        ),
+                        types.Part.from_text(text=prompt),
+                    ],
+                )
+            ]
 
-        response = self._client.models.generate_content(
-            model=CONVERTER_MODEL,
-            contents=contents,
-        )
+            logger.info(
+                "event=converter_request model=%s animal=%s photo_bytes=%d",
+                CONVERTER_MODEL,
+                suggested_animal,
+                len(original_photo_bytes),
+            )
 
-        image_bytes, mime_type = _extract_image(response)
-        if image_bytes is None:
-            raise RuntimeError("converter returned no image data")
+            response = self._client.models.generate_content(
+                model=CONVERTER_MODEL,
+                contents=contents,
+            )
 
-        return ConverterResult(
-            suggested_animal=suggested_animal,
-            image_bytes=image_bytes,
-            image_mime_type=mime_type,
-        )
+            image_bytes, mime_type = _extract_image(response)
+            if image_bytes is None:
+                raise RuntimeError("converter returned no image data")
+
+            return ConverterResult(
+                suggested_animal=suggested_animal,
+                image_bytes=image_bytes,
+                image_mime_type=mime_type,
+            )
+
+        return call_with_retries(_generate, sleeper=self._sleeper)
 
 
 def _extract_image(response: object) -> tuple[bytes | None, str]:

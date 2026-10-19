@@ -52,13 +52,20 @@ and delivered as a **playable Telegram voice note** after the script text.
 A TTS or send failure degrades to a friendly reply; the session always ends
 in `DONE`.
 
+**Phase 7 — Resilience.** `/start` and `/restart` purge session state *and*
+temporary media (photo bytes and script) in any phase, without restarting the
+process, and log the purge. Stage guards answer text or a stray photo during
+the image stage with one "sit tight" nudge, leaving the run untouched. A
+transient Gemini timeout is retried with capped backoff at each model
+boundary; on exhaustion the stage degrades to a friendly reply and the
+session stays alive — no exception ever escapes into the user's flow.
+
 The full pipeline: `Bouncer → Interviewer → Converter → Scripter →
 Narrator` — send a portrait, answer the interview, and receive the hybrid
 portrait, the script text, and a playable voice note.
 
-The one remaining later phase is **Phase 7 — Resilience** (`/restart`
-temp-media cleanup, wrong-payload guards, timeout/backoff fallbacks),
-ordered in [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md).
+Every phase is now delivered; see [`SPECS/ROADMAP.md`](SPECS/ROADMAP.md) for
+the ordered plan and delivered notes.
 
 ## Contents
 
@@ -140,7 +147,7 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 112 offline tests + 3 live (skipped by default)
+./scripts/test    # 363 offline tests + 8 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
 

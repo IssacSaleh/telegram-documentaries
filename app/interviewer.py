@@ -24,12 +24,15 @@ log records `answer_chars` and the question index instead.
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from app.adk_utils import extract_json
 from app.logging_utils import get_logger, logged
 from app.models import Dossier, DossierAnswer, InterviewTurn, OutboundMessage
+from app.resilience import call_with_retries
 from app.state import Session, SessionPhase, get_store
 
 logger = get_logger("interviewer")
@@ -44,6 +47,17 @@ MAX_QUESTIONS = 7
 #: Tokens accepted as confirmation of the invitation to be interviewed.
 CONFIRMATION_TOKENS = frozenset({"yes", "y"})
 
+#: Phases in which the portrait pipeline is in flight (ROADMAP §7). A stray
+#: text or photo here must neither clobber the run nor be re-gated by the
+#: Bouncer — it gets the single "sit tight" nudge below instead.
+IMAGE_STAGE_PHASES = frozenset(
+    {
+        SessionPhase.GENERATING_IMAGE,
+        SessionPhase.SCRIPTING,
+        SessionPhase.NARRATING,
+    }
+)
+
 #: User-facing copy. Named constants keep it greppable and testable, matching
 #: the Phase 1 `ReplyPolicy` / Phase 2 `RejectionPolicy` pattern.
 CONFIRMATION_PROMPT = (
@@ -53,6 +67,10 @@ CONFIRMATION_PROMPT = (
 PHOTO_PROMPT = "Send me a photo of yourself first, and we'll get started."
 WRONG_PAYLOAD_PROMPT = (
     "No photos needed right now — just answer in words, please."
+)
+IMAGE_STAGE_BUSY_PROMPT = (
+    "Your portrait is already in progress — sit tight while I finish it. "
+    "I'll be with you again in a moment."
 )
 RETRY_PROMPT = "Sorry, I lost my train of thought. Send that answer again?"
 PORTRAIT_PENDING_REPLY = (
@@ -115,11 +133,14 @@ class AdkInterviewer:
     touch ADK or the network), synchronous `asyncio.run` from the gateway's
     long-poll loop, one runner per turn so sessions can never be shared
     across chats, and the shared `extract_json` prose-tolerance rule.
+    Transient Gemini timeouts are retried with capped backoff (ROADMAP §7);
+    exhaustion re-raises for the RETRY_PROMPT degrade path.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, sleeper: Callable[[float], None] = time.sleep) -> None:
         from google.adk.agents import LlmAgent
 
+        self._sleeper = sleeper
         self._agent = LlmAgent(
             name="interviewer",
             model=INTERVIEWER_MODEL,
@@ -129,7 +150,10 @@ class AdkInterviewer:
         )
 
     def next_turn(self, dossier: Dossier) -> InterviewTurn:
-        return asyncio.run(self._run(self._prompt(dossier)))
+        return call_with_retries(
+            lambda: asyncio.run(self._run(self._prompt(dossier))),
+            sleeper=self._sleeper,
+        )
 
     def final_turn(self, dossier: Dossier) -> InterviewTurn:
         prompt = (
@@ -138,7 +162,10 @@ class AdkInterviewer:
             "You must finish now: set is_complete to true, give the "
             "suggested_animal and its rationale, and set next_question to null."
         )
-        return asyncio.run(self._run(prompt))
+        return call_with_retries(
+            lambda: asyncio.run(self._run(prompt)),
+            sleeper=self._sleeper,
+        )
 
     @staticmethod
     def _prompt(dossier: Dossier) -> str:
@@ -395,6 +422,21 @@ def handle_wrong_payload(chat_id: int) -> InterviewDecision:
     logger.info("event=wrong_payload_ignored chat_id=%s", chat_id)
     return InterviewDecision(
         reply=OutboundMessage(chat_id=chat_id, text=WRONG_PAYLOAD_PROMPT)
+    )
+
+
+def handle_wrong_stage(chat_id: int) -> InterviewDecision:
+    """Text or a photo arrived while the portrait pipeline is running.
+
+    ROADMAP §7 stage guard: during GENERATING_IMAGE / SCRIPTING / NARRATING
+    the in-flight run must not be clobbered — a photo here is NOT a fresh
+    Bouncer submission, and text is not an answer. The single "sit tight"
+    nudge goes out; no session state is touched, so the run continues
+    untouched and the conversation stays alive.
+    """
+    logger.info("event=wrong_stage_ignored chat_id=%s", chat_id)
+    return InterviewDecision(
+        reply=OutboundMessage(chat_id=chat_id, text=IMAGE_STAGE_BUSY_PROMPT)
     )
 
 
