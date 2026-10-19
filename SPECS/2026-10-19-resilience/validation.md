@@ -55,14 +55,19 @@
 ## 6. Results
 _(Filled in by the verifier after running the checklist.)_
 
-- Automated checks: `./scripts/test` → **363 passed, 8 skipped** (the 8 are the
+- Automated checks: `./scripts/test` → **368 passed, 8 skipped** (the 8 are the
   `RUN_LIVE_TESTS=1`-gated live Gemini tests). `./scripts/hooks` → ruff
   **All checks passed!**, mypy **Success: no issues found in 14 source files**.
 - Acceptance tests: **A1–A4 all pass.**
-  - A1 — `test_state.py::TestReset::test_reset_purges_the_chats_temporary_media`
-    + `test_reset_clears_media_fields_before_dropping_the_session`, and
+  - A1 — `test_state.py::TestReset::test_reset_purges_the_chats_temporary_media`,
+    `test_reset_clears_media_fields_before_dropping_the_session`,
+    `TestPurge::test_clears_conversation_history_and_media`,
+    `test_reset_clears_a_held_reference_too`; and
     `test_gateway.py::TestRestartCommand::test_reset_purges_temporary_media_and_logs_the_purge`
-    (mid-pipeline run, `/start` and `/restart`, `event=temp_media_purged`).
+    + `test_reset_mid_interview_clears_history_and_media` (mid-pipeline and
+    mid-interview runs; `/start` and `/restart`; conversation history, media,
+    and held references all cleared; `event=temp_media_purged`). No background
+    tasks exist (synchronous loop), so none can survive.
   - A2 — `test_state.py::TestReset::test_reset_purges_the_session_so_the_next_run_starts_clean`
     and `test_gateway.py::TestEndToEndResilience::test_a_fresh_run_after_restart_behaves_like_a_first_run`
     (full run → `/restart` → fresh photo + interview, fresh dossier).

@@ -191,6 +191,68 @@ class TestClearMedia:
         assert session.original_photo_bytes is None
 
 
+class TestPurge:
+    """ROADMAP §7: a reset drops the *whole* chat — conversation history
+    (dossier + open question) as well as temporary media — not just the dict
+    entry. There are no background tasks to cancel (the loop is synchronous);
+    `purge()` is the explicit, testable clear-point `reset()` uses."""
+
+    def _mid_conversation(self) -> Session:
+        from app.models import Dossier, DossierAnswer
+
+        session = _populate_media(Session(chat_id=111))
+        session.phase = SessionPhase.INTERVIEWING
+        session.pending_question = "What is your spirit animal?"
+        session.dossier = Dossier(
+            answers=[DossierAnswer(question="Q1?", answer="A1")],
+            suggested_animal="Red Fox",
+        )
+        return session
+
+    def test_clears_conversation_history_and_media(self) -> None:
+        session = self._mid_conversation()
+
+        session.purge()
+
+        assert session.dossier is None, "conversation history must be gone"
+        assert session.pending_question is None, "the open question must be gone"
+        assert session.original_photo_bytes is None
+        assert session.original_photo_mime is None
+        assert session.original_photo_file_id is None
+        assert session.script is None
+
+    def test_reset_clears_a_held_reference_too(self) -> None:
+        """Dropping the store entry must not be the *only* cleanup: a held
+        reference to the old Session must not retain the user's data."""
+        from app.models import Dossier, DossierAnswer
+
+        store = SessionStore()
+        session = store.get_or_create(111)
+        _populate_media(session)
+        session.phase = SessionPhase.INTERVIEWING
+        session.pending_question = "What is your spirit animal?"
+        session.dossier = Dossier(
+            answers=[DossierAnswer(question="Q1?", answer="A1")],
+            suggested_animal="Red Fox",
+        )
+
+        store.reset(111)
+
+        assert store.get(111) is None
+        assert session.dossier is None
+        assert session.pending_question is None
+        assert session.original_photo_bytes is None
+        assert session.script is None
+
+    def test_is_idempotent(self) -> None:
+        session = self._mid_conversation()
+
+        session.purge()
+        session.purge()  # must not raise
+
+        assert session.dossier is None
+
+
 class TestGlobalDriver:
     def test_get_store_returns_a_shared_singleton(self) -> None:
         """TECH: one shared state driver — stages do not invent their own."""

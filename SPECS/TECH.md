@@ -116,10 +116,13 @@ and report HTTP status plus Telegram's `description` instead.
 - **One shared state driver** — stages do not each invent their own storage.
 - `/start` and `/restart` purge session state and temporary media, without
   restarting the process. `/start` and `/restart` take precedence in *any*
-  phase. The purge is explicit: `Session.clear_media()` drops the session's
-  photo bytes/mime/file_id and script, `SessionStore.reset()` logs
+  phase. The purge is explicit: `Session.purge()` clears the conversation
+  history (dossier, open question) **and** the media (photo
+  bytes/mime/file_id, script), `SessionStore.reset()` logs
   `event=temp_media_purged`, then the session is dropped. There are **no
-  on-disk temp files**; the in-memory session is their only owner.
+  on-disk temp files** and **no background tasks** (the loop is synchronous
+  and single-threaded), so the in-memory session is the only owner of a
+  chat's transient artifacts.
 
 ### State machine phases
 

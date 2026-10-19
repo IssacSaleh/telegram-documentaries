@@ -263,6 +263,53 @@ class TestRestartCommand:
             for r in caplog.records
         ), "the media purge must be logged for operators"
 
+    @pytest.mark.parametrize("command", ["/start", "/restart"])
+    def test_reset_mid_interview_clears_history_and_media(
+        self, command: str
+    ) -> None:
+        """ROADMAP §7 acceptance 1: a reset mid-conversation must leave no
+        residual user state of any kind — no session, and no conversation
+        history (dossier + open question) or temporary media (photo + script)
+        retained even via a held reference to the old Session."""
+        store = get_store()
+        interviewer = FakeInterviewer()
+        sender = RecordingSender()
+        chat_id = 881
+        # Mid-interview: photo stored, one answer recorded, a question open.
+        handle_update(
+            _photo_update(chat_id),
+            sender,
+            fetcher=FakePhotoFetcher(data=b"\xff\xd8ORIGINAL", mime="image/jpeg"),
+            classifier=FakeClassifier(human_verdict()),
+            interviewer=interviewer,
+        )
+        handle_update(_update("yes", chat_id=chat_id), sender, interviewer=interviewer)
+        handle_update(
+            _update("I collect stamps", chat_id=chat_id),
+            sender,
+            interviewer=interviewer,
+        )
+        live = store.get(chat_id)
+        assert live is not None
+        assert live.phase is SessionPhase.INTERVIEWING
+        assert live.dossier is not None and live.dossier.answers, "history exists"
+        assert live.pending_question is not None, "an open question exists"
+        assert live.original_photo_bytes == b"\xff\xd8ORIGINAL"
+
+        handle_update(_update(command, chat_id=chat_id))
+
+        assert store.get(chat_id) is None, "no session survives the reset"
+        assert live.dossier is None, "no residual conversation history"
+        assert live.pending_question is None, "no residual open question"
+        assert live.original_photo_bytes is None, "no residual photo"
+        assert live.script is None
+
+        # The very next message is treated as brand new, not resumed.
+        reply = handle_update(_update("hello", chat_id=chat_id))
+        assert reply is not None
+        assert reply.text == PHOTO_PROMPT
+        assert store.get(chat_id) is None, "a reset chat is not registered"
+
 
 class TestReplyIsAuditable:
     def test_a_sent_reply_is_logged_at_info(self, caplog) -> None:

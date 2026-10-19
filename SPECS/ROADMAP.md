@@ -122,9 +122,11 @@ the dossier.
   `classify`, Interviewer `next_turn`/`final_turn`, Converter `generate`,
   Scripter `generate_script`, Narrator `synthesise` — never in the gateway,
   whose existing per-stage degrade paths turn an exhausted retry into a
-  friendly reply. `Session.clear_media()` + `SessionStore.reset()` purge the
-  session's photo bytes/mime/file_id and script and log
-  `event=temp_media_purged` before dropping the session. Stage guards
+  friendly reply. `Session.purge()` + `SessionStore.reset()` clear the
+  session's conversation history (dossier, open question) and its
+  photo bytes/mime/file_id and script, log `event=temp_media_purged`, then
+  drop the session (no background tasks exist to cancel — the loop is
+  synchronous). Stage guards
   (`IMAGE_STAGE_PHASES`, `handle_wrong_stage`, `IMAGE_STAGE_BUSY_PROMPT`)
   answer text *and* a stray photo during `GENERATING_IMAGE`/`SCRIPTING`/
   `NARRATING` with one "sit tight" nudge, mutating no state and never

@@ -147,7 +147,7 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 363 offline tests + 8 live (skipped by default)
+./scripts/test    # 368 offline tests + 8 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
 

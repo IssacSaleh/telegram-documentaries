@@ -95,9 +95,14 @@ Gemini timeout never raises into the user's flow."*
 
 - `Session.clear_media()` — sets `original_photo_bytes`,
   `original_photo_mime`, `original_photo_file_id`, and `script` to `None` and
-  touches the session.
-- `SessionStore.reset(chat_id)` — logs `event=temp_media_purged` then drops the
-  session. Idempotent; unknown chats are a no-op.
+  touches the session. (Media only; leaves phase/dossier/pending question.)
+- `Session.purge()` — `clear_media()` **plus** conversation history
+  (`dossier`, `pending_question`). The explicit clear-point `reset()` uses.
+- `SessionStore.reset(chat_id)` — `purge()`s the session (media + conversation
+  history), logs `event=temp_media_purged`, then drops it. Idempotent; unknown
+  chats are a no-op. There are no background tasks to cancel: the loop is
+  synchronous and single-threaded, so an in-flight `handle_update` completes
+  before any later reset is processed.
 
 `app/interviewer.py`:
 
@@ -129,8 +134,11 @@ Gemini timeout never raises into the user's flow."*
 ## Acceptance criteria
 
 1. **Restart leaves no residual user state or temporary media.** After
-   `/start` / `/restart`, the chat has no session and no media artifacts
-   (photo bytes, mime, file_id, script) retained anywhere; the purge is logged.
+   `/start` / `/restart`, the chat has no session and no residual artifacts
+   retained anywhere — conversation history (dossier, open question) and
+   temporary media (photo bytes, mime, file_id, script) are all cleared, even
+   via a held reference to the old session; the purge is logged. No background
+   task survives (none exist: the loop is synchronous).
 2. **The next run starts cleanly.** A photo + interview immediately after a
    reset behaves exactly like a first ever run (fresh dossier, `AWAITING_PHOTO`
    → admission → interview).
