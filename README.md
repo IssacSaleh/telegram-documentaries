@@ -152,25 +152,29 @@ before every commit:
 | `./scripts/hooks` | `ruff check app tests` + `mypy app` | Before every commit |
 
 ```bash
-./scripts/test    # 372 offline tests + 8 live (skipped by default)
+./scripts/test    # 372 offline tests + 9 live (skipped by default)
 ./scripts/hooks   # lint + type checks
 ```
 
 The default run is **offline and deterministic**: unit tests make no network
 calls, and the live Gemini tests are skipped.
 
-### Live Bouncer tests
+### Live Gemini tests
 
-Three integration tests drive the real Bouncer end to end against Gemini 3.1
-Flash Lite — a person is admitted, a landscape is rejected (with state reset),
-and a rejection never touches another chat's state. Enable them explicitly:
+Opt-in integration tests drive each real Gemini-backed stage end to end against
+its pinned model — the Bouncer (a person is admitted, a landscape is rejected
+with state reset, and a rejection never touches another chat's state), the
+Interviewer, the Converter, the Scripter, and the Narrator. Enable them
+explicitly:
 
 ```bash
 RUN_LIVE_TESTS=1 ./scripts/test
 ```
 
-They read `tests/fixtures/person.jpg` and `tests/fixtures/landscape.jpg`,
-whose contents were verified against the same model.
+With no credentials present they skip cleanly rather than erroring. The Bouncer
+tests read `tests/fixtures/person.jpg` and `tests/fixtures/landscape.jpg`, whose
+contents were verified against the same model; the Converter live test reuses
+`person.jpg`.
 
 Tests are written **before** code (Red/Green TDD — SPECS/TECH.md). See
 [`SPECS/TECH.md`](SPECS/TECH.md) for the full policy.

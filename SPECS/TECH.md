@@ -173,7 +173,7 @@ never re-gating the photo through the Bouncer (which would clobber the run).
   - `scripts/hooks`
 - These scripts are documented here **and** in the README, and kept in sync.
 - The default run is offline and deterministic. Every test that calls the real
-  Gemini API (Bouncer, Interviewer, Converter, Narrator) lives in
+  Gemini API (Bouncer, Interviewer, Converter, Scripter, Narrator) lives in
   `tests/integration/` and is gated behind `RUN_LIVE_TESTS=1` (e.g.
   `RUN_LIVE_TESTS=1 ./scripts/test`). A live run with no credentials skips
   those tests cleanly (with a reason) rather than erroring.
