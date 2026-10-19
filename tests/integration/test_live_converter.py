@@ -1,27 +1,33 @@
-"""Live test for Phase 4 Converter (opt-in)."""
+"""Live test for Phase 4 Converter (opt-in; see conftest.py).
+
+Exercises the real Gemini image model end to end: a portrait + dossier +
+suggested animal go in, a generated image comes out. Uses the local
+`person.jpg` fixture (the same content-verified portrait the live Bouncer
+test uses) so the only network dependency is Gemini itself.
+"""
 
 from __future__ import annotations
 
 import os
+import pathlib
 
 import pytest
 
-
-@pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_TESTS") != "1", reason="RUN_LIVE_TESTS!=1"
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_TESTS") != "1",
+    reason="live Gemini calls; set RUN_LIVE_TESTS=1 to enable",
 )
-def test_live_converter_produces_an_image() -> None:
-    import httpx
 
+FIXTURES = pathlib.Path(__file__).resolve().parent.parent / "fixtures"
+
+
+def test_live_converter_produces_an_image(live_credentials: None) -> None:
     from app.converter import GenAiConverter, dossier_to_summary
     from app.models import Dossier, DossierAnswer
 
-    # Use a small reliable image (1x1 placeholder from a stable CDN-like source).
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        r = client.get("https://placehold.co/256x256/png")
-        r.raise_for_status()
-        photo_bytes = r.content
-        photo_mime = "image/png"
+    # A real portrait from the local fixtures — no external CDN dependency.
+    photo_bytes = (FIXTURES / "person.jpg").read_bytes()
+    photo_mime = "image/jpeg"
 
     dossier = Dossier(
         answers=[

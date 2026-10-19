@@ -25,10 +25,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def interviewer() -> AdkInterviewer:
-    from app.config import load_settings
-
-    load_settings()  # ensures GEMINI_API_KEY present if possible
+def interviewer(live_credentials: None) -> AdkInterviewer:
+    """A real Interviewer; `live_credentials` loads `.env` or skips cleanly."""
     return AdkInterviewer()
 
 

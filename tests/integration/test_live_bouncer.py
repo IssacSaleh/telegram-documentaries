@@ -21,7 +21,6 @@ import pathlib
 import pytest
 
 from app.bouncer import REJECTION_REPLY, AdkHumanPresenceClassifier, bounce
-from app.config import ConfigError, load_settings
 from app.models import TelegramUpdate
 from app.state import get_store
 
@@ -51,16 +50,13 @@ class _FixturePhotoFetcher:
 
 
 @pytest.fixture(scope="module")
-def classifier() -> AdkHumanPresenceClassifier:
+def classifier(live_credentials: None) -> AdkHumanPresenceClassifier:
     """One classifier per run: the ADK agent is expensive to construct.
 
-    `load_settings()` pulls `.env` into the process environment (secrets are
-    redacted in logs by design) so the ADK client finds `GEMINI_API_KEY`.
+    `live_credentials` (see `conftest.py`) loads `.env` into the process
+    environment so the ADK client finds `GEMINI_API_KEY`, and skips the whole
+    module cleanly when credentials are absent.
     """
-    try:
-        load_settings()
-    except ConfigError as exc:
-        pytest.skip(f"no credentials for live calls: {exc}")
     return AdkHumanPresenceClassifier()
 
 

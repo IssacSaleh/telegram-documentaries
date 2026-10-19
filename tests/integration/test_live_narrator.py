@@ -11,22 +11,21 @@ import os
 
 import pytest
 
-
-@pytest.mark.skipif(
-    os.environ.get("RUN_LIVE_TESTS") != "1", reason="RUN_LIVE_TESTS!=1"
+pytestmark = pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_TESTS") != "1",
+    reason="live Gemini calls; set RUN_LIVE_TESTS=1 to enable",
 )
-def test_live_narrator_synthesises_verified_ogg_opus() -> None:
-    from app.config import load_settings
+
+
+def test_live_narrator_synthesises_verified_ogg_opus(live_credentials: None) -> None:
     from app.narrator import (
         NARRATOR_MODEL,
         GeminiTtsNarrator,
         verify_ogg_opus,
     )
 
-    # Load `.env` like the other live tests do: the genai client reads
-    # GEMINI_API_KEY from the process environment at construction time.
-    load_settings()
-
+    # `live_credentials` (see conftest.py) loads `.env` so the genai client
+    # finds GEMINI_API_KEY, and skips the test cleanly if it is absent.
     narrator = GeminiTtsNarrator()
     ogg = narrator.synthesise(
         "In the quiet hours of the evening, a most cunning fox stirs."
